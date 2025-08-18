@@ -11,8 +11,9 @@ $StopWatch = new-object system.diagnostics.stopwatch
 $StopWatch.Start()
 
 Add-Type -AssemblyName PresentationCore, PresentationFramework
-. ( 'D:\Mega\IDEs\powershell\#lib\functions.ps1'       )
-. ( 'D:\Mega\IDEs\powershell\#lib\functions-forms.ps1' )
+Set-Location $PSScriptRoot
+. ..\#lib\functions.ps1       
+. ..\#lib\functions-forms.ps1
 
 $fileS = $inputFiles -split [Environment]::NewLine
 
@@ -40,7 +41,7 @@ foreach ( $file in $fileS ) {
     $parameters += $outputFile
     # Write-Host $parameters
     # pause
-    ffmpeg $parameters
+    & ffmpeg $parameters
     # pause
 }
 
