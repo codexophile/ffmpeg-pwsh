@@ -2,7 +2,11 @@ Param( $InputFile )
 
 . ( 'c:\Mega\IDEs\powershell\#lib\functions.ps1' )
 Set-Location $PSScriptRoot
-$ffmpegPath = 'ffmpeg'
+$ffmpegPath = & .\ffmpeg-find.ps1
+if( -not $ffmpegPath ) {
+  Write-Error "ffmpeg not found. Please install ffmpeg and ensure it is in your PATH."
+  return
+}
 
 $ParentPath = Split-Path -Path $InputFile -Parent
 $LeafBase = Split-Path -Path $InputFile -LeafBase
