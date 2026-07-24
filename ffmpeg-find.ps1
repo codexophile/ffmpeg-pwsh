@@ -11,7 +11,7 @@ function Find-FfmpegInWinGet {
   $EsPath = "C:\mega\program-files\Everything\es.exe"
   if(-not (Test-Path -Path $EsPath -PathType Leaf)) {
     Write-Error "Everything Search (es.exe) not found at path: $EsPath"
-    return false
+    return $false
   }
   Write-Host "Searching for ffmpeg.exe in WinGet packages using Everything Search..." -ForegroundColor Cyan
   $EsQuery1 = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_"
