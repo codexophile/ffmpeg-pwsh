@@ -1,5 +1,11 @@
 param ( $inputFiles, $outputExt, [switch]$silent, [switch]$ACodec, [switch]$VCodec, [switch]$720p )
 
+$ffmpegPath = & $PSScriptRoot/ffmpeg-find.ps1
+if( -not $ffmpegPath ) {
+  Write-Error "ffmpeg not found. Please install ffmpeg and ensure it is in your PATH."
+  return
+}
+
 Write-Host "input files    : $inputFiles"
 Write-Host "ext            : $outputExt"
 Write-Host "AC             : $ACodec"
@@ -41,7 +47,7 @@ foreach ( $file in $fileS ) {
     $parameters += $outputFile
     # Write-Host $parameters
     # pause
-    & ffmpeg $parameters
+    & $ffmpegPath $parameters
     # pause
 }
 
