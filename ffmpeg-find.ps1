@@ -1,12 +1,3 @@
-if( -not -not (Get-Command ffmpeg -ErrorAction SilentlyContinue) ) {
-  Write-Information "ffmpeg found in PATH: $(Get-Command ffmpeg).Source"
-  return (Get-Command ffmpeg).Source
-}
-
-Write-Warning "ffmpeg not found in PATH." 
-$FfmpegPath = Find-FfmpegInWinGet
-return $FfmpegPath
- 
 function Find-FfmpegInWinGet {
   $EsPath = "C:\mega\program-files\Everything\es.exe"
   if(-not (Test-Path -Path $EsPath -PathType Leaf)) {
@@ -22,3 +13,13 @@ function Find-FfmpegInWinGet {
   Write-Host "ffmpeg found in WinGet packages: $FfmpegWingetPath" -ForegroundColor Green
   return $FfmpegWingetPath
 }
+
+if( -not -not (Get-Command ffmpeg -ErrorAction SilentlyContinue) ) {
+  Write-Information "ffmpeg found in PATH: $(Get-Command ffmpeg).Source"
+  return (Get-Command ffmpeg).Source
+}
+
+Write-Warning "ffmpeg not found in PATH." 
+$FfmpegPath = Find-FfmpegInWinGet
+return $FfmpegPath
+ 
