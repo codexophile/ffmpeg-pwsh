@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
   [ValidateSet('general', 'Gyan', 'yt-dlp')]
-  [string]$Variety = 'general'
+  [string]$Variety = 'general',
+  [ValidateSet('ffmpeg', 'ffprobe')]
+  [string]$Executable = 'ffmpeg'
 )
 
 function Find-FfmpegInWinGet {
@@ -16,9 +18,9 @@ function Find-FfmpegInWinGet {
     return $null
   }
 
-  Write-Host "Searching for ffmpeg.exe ($PackageVariety) in WinGet packages using Everything Search..." -ForegroundColor Cyan
+  Write-Host "Searching for $Executable.exe ($PackageVariety) in WinGet packages using Everything Search..." -ForegroundColor Cyan
   $EsQuery1 = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\$PackageVariety.FFmpeg_Microsoft.Winget.Source_"
-  $EsQuery2 = "\bin\ffmpeg.exe"
+  $EsQuery2 = "\bin\$Executable.exe"
   $EsParams = @('-p', $EsQuery1, $EsQuery2)
   $EsResult = & $EsPath $EsParams
   $FfmpegWingetPath = ($EsResult -split '\r?\n')[0]
@@ -28,7 +30,7 @@ function Find-FfmpegInWinGet {
     return $null
   }
 
-  Write-Host "ffmpeg found in WinGet packages: $FfmpegWingetPath" -ForegroundColor Green
+  Write-Host "$Executable.exe found in WinGet packages: $FfmpegWingetPath" -ForegroundColor Green
   return $FfmpegWingetPath
 }
 
@@ -66,7 +68,7 @@ else {
 }
 
 if (-not $FfmpegPath) {
-  Write-Error "ffmpeg.exe could not be located."
+  Write-Error "$Executable.exe could not be located."
 }
 
 return $FfmpegPath
