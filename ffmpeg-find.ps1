@@ -18,7 +18,7 @@ function Find-FfmpegInWinGet {
     return $null
   }
 
-  Write-Host "Searching for $Executable.exe ($PackageVariety) in WinGet packages using Everything Search..." -ForegroundColor Cyan
+  Write-Verbose "Searching for $Executable.exe ($PackageVariety) in WinGet packages using Everything Search..."
   $EsQuery1 = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\$PackageVariety.FFmpeg_Microsoft.Winget.Source_"
   $EsQuery2 = "\bin\$Executable.exe"
   $EsParams = @('-p', $EsQuery1, $EsQuery2)
@@ -26,22 +26,22 @@ function Find-FfmpegInWinGet {
   $FfmpegWingetPath = ($EsResult -split '\r?\n')[0]
 
   if ([string]::IsNullOrWhiteSpace($FfmpegWingetPath)) {
-    Write-Warning "ffmpeg ($PackageVariety) not found in WinGet packages."
+    Write-Verbose "ffmpeg ($PackageVariety) not found in WinGet packages."
     return $null
   }
 
-  Write-Host "$Executable.exe found in WinGet packages: $FfmpegWingetPath" -ForegroundColor Green
+  Write-Verbose "$Executable.exe found in WinGet packages: $FfmpegWingetPath"
   return $FfmpegWingetPath
 }
 
 function Find-FfmpegGeneral {
   $Cmd = Get-Command ffmpeg -ErrorAction SilentlyContinue
   if ($Cmd) {
-    Write-Information "ffmpeg found in PATH: $($Cmd.Source)"
+    Write-Verbose "ffmpeg found in PATH: $($Cmd.Source)"
     return $Cmd.Source
   }
 
-  Write-Warning "ffmpeg not found in PATH."
+  Write-Verbose "ffmpeg not found in PATH."
 
   # No specific variety requested (or it already failed) — try each known variety
   foreach ($PackageVariety in @('Gyan', 'yt-dlp')) {
@@ -62,7 +62,7 @@ if ($Variety -eq 'general') {
 else {
   $FfmpegPath = Find-FfmpegInWinGet -PackageVariety $Variety
   if (-not $FfmpegPath) {
-    Write-Warning "Specific variety '$Variety' not found. Falling back to general search..."
+    Write-Verbose "Specific variety '$Variety' not found. Falling back to general search..."
     $FfmpegPath = Find-FfmpegGeneral
   }
 }
