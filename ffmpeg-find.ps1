@@ -12,7 +12,7 @@ function Find-FfmpegInWinGet {
     [string]$PackageVariety
   )
 
-  $EsPath = "C:\mega\program-files\Everything\es.exe"
+  $EsPath = 'C:\mega\program-files\Everything\es.exe'
   if (-not (Test-Path -Path $EsPath -PathType Leaf)) {
     Write-Error "Everything Search (es.exe) not found at path: $EsPath"
     return $null
@@ -36,12 +36,12 @@ function Find-FfmpegInWinGet {
 
 function Find-FfmpegGeneral {
   $Cmd = Get-Command ffmpeg -ErrorAction SilentlyContinue
-  if ($Cmd) {
+  if ($Cmd -and $Cmd.Source) {
     Write-Verbose "ffmpeg found in PATH: $($Cmd.Source)"
     return $Cmd.Source
   }
 
-  Write-Verbose "ffmpeg not found in PATH."
+  Write-Verbose 'ffmpeg not found in PATH.'
 
   # No specific variety requested (or it already failed) — try each known variety
   foreach ($PackageVariety in @('Gyan', 'yt-dlp')) {
