@@ -1,4 +1,4 @@
-param ( $inputFiles, $outputFileName )
+param ( $inputFiles, $outputFileName = '' )
 
 . ( 'D:\Mega\IDEs\powershell\functions.ps1' )
 
@@ -14,7 +14,7 @@ Write-Host "New file name : $newFileName"
 Pause
 
 # Create a temporary text file that FFmpeg will use to concatenate the videos
-$tempListFile = "ffmpeg-concat.txt"
+$tempListFile = 'ffmpeg-concat.txt'
 $inputFilesArray | ForEach-Object { "file '$_'" } | Out-File -Encoding ASCII $tempListFile
 
 # Execute the FFmpeg command to concatenate the videos
