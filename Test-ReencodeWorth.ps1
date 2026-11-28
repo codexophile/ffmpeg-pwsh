@@ -174,6 +174,7 @@ Set-StrictMode -Version 1.0
 $ErrorActionPreference = 'Stop'
 $Script:SelectedGpu = $null
 if ($Gpu -and -not $UseGpu) { throw '-Gpu can only be used together with -UseGpu.' }
+. (Join-Path $PSScriptRoot 'Reencode.Common.ps1')
 
 #region Constants
 
@@ -334,30 +335,7 @@ function Invoke-Native {
     [Parameter(Mandatory, Position = 0)][string]$FilePath,
     [Parameter(Mandatory, Position = 1)][string[]]$Arguments
   )
-  $oldPreference = $ErrorActionPreference
-  $oldCudaDeviceOrder = $env:CUDA_DEVICE_ORDER
-  if ($Script:SelectedGpu -and $Script:SelectedGpu.VendorId -eq '10de' -and
-      $null -ne $Script:SelectedGpu.NvidiaIndex) {
-    $env:CUDA_DEVICE_ORDER = 'PCI_BUS_ID'
-  }
-  $ErrorActionPreference = 'Continue'
-  try {
-    $lines = & $FilePath @Arguments 2>&1 | ForEach-Object { "$_" }
-    $exitCode = $LASTEXITCODE
-  }
-  finally {
-    $ErrorActionPreference = $oldPreference
-    if ($null -eq $oldCudaDeviceOrder) {
-      Remove-Item Env:CUDA_DEVICE_ORDER -ErrorAction SilentlyContinue
-    }
-    else {
-      $env:CUDA_DEVICE_ORDER = $oldCudaDeviceOrder
-    }
-  }
-  return [pscustomobject]@{
-    ExitCode = $exitCode
-    Output   = ($lines -join "`n")
-  }
+  return Invoke-NativeCommand -FilePath $FilePath -Arguments $Arguments -Gpu $Script:SelectedGpu
 }
 
 #endregion
@@ -943,38 +921,6 @@ function Get-VideoEncoderArguments {
     $a = @('-c:v', 'libsvtav1', '-preset', $Preset, '-crf', "$Crf", '-pix_fmt', 'yuv420p10le')
   }
   return $a
-}
-
-function Get-SamplePlan {
-  <#
-    .SYNOPSIS
-        Chooses clip start times spread evenly across the file (centered in equal segments).
-    .PARAMETER Duration
-        File duration in seconds.
-    .PARAMETER Count
-        Desired number of clips.
-    .PARAMETER Seconds
-        Desired clip length in seconds.
-    .OUTPUTS
-        [pscustomobject[]] each with Start and Length (seconds).
-    #>
-  [CmdletBinding()]
-  [OutputType([pscustomobject[]])]
-  param(
-    [Parameter(Mandatory)][double]$Duration,
-    [Parameter(Mandatory)][int]$Count,
-    [Parameter(Mandatory)][int]$Seconds
-  )
-  if ($Duration -le ($Seconds * 1.5)) {
-    return @([pscustomobject]@{ Start = 0.0; Length = [Math]::Min($Duration, [double]$Seconds) })
-  }
-  $n = [Math]::Max(1, [Math]::Min($Count, [int][Math]::Floor($Duration / $Seconds)))
-  $plan = for ($i = 0; $i -lt $n; $i++) {
-    $center = $Duration * ($i + 0.5) / $n
-    $start = [Math]::Max(0.0, [Math]::Min($center - $Seconds / 2.0, $Duration - $Seconds))
-    [pscustomobject]@{ Start = $start; Length = [double]$Seconds }
-  }
-  return @($plan)
 }
 
 function Get-ClipDuration {

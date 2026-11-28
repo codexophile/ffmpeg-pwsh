@@ -115,6 +115,7 @@ param(
 
 Set-StrictMode -Version 1.0
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Reencode.Common.ps1')
 
 function Resolve-Executable {
   param(
@@ -147,44 +148,7 @@ function Invoke-Native {
     [Parameter(Mandatory)][string]$FilePath,
     [Parameter(Mandatory)][string[]]$Arguments
   )
-
-  $oldPreference = $ErrorActionPreference
-  $oldCudaDeviceOrder = $env:CUDA_DEVICE_ORDER
-  if ($Script:PreferredGpu -and $Script:PreferredGpu.VendorId -eq '10de' -and
-      $null -ne $Script:PreferredGpu.NvidiaIndex) {
-    $env:CUDA_DEVICE_ORDER = 'PCI_BUS_ID'
-  }
-  $ErrorActionPreference = 'Continue'
-  try {
-    $lines = & $FilePath @Arguments 2>&1 | ForEach-Object { "$_" }
-    $exitCode = $LASTEXITCODE
-  }
-  finally {
-    $ErrorActionPreference = $oldPreference
-    if ($null -eq $oldCudaDeviceOrder) {
-      Remove-Item Env:CUDA_DEVICE_ORDER -ErrorAction SilentlyContinue
-    }
-    else {
-      $env:CUDA_DEVICE_ORDER = $oldCudaDeviceOrder
-    }
-  }
-  [pscustomobject]@{ ExitCode = $exitCode; Output = ($lines -join "`n") }
-}
-
-function Get-SamplePlan {
-  param(
-    [Parameter(Mandatory)][double]$Duration,
-    [Parameter(Mandatory)][int]$Count,
-    [Parameter(Mandatory)][double]$Seconds
-  )
-
-  $length = [Math]::Min($Seconds, $Duration)
-  $count = [Math]::Min($Count, [Math]::Max(1, [int][Math]::Floor($Duration / $length)))
-  for ($i = 0; $i -lt $count; $i++) {
-    $center = $Duration * ($i + 0.5) / $count
-    $start = [Math]::Max(0.0, [Math]::Min($center - ($length / 2), $Duration - $length))
-    [pscustomobject]@{ Start = $start; Length = $length }
-  }
+  return Invoke-NativeCommand -FilePath $FilePath -Arguments $Arguments -Gpu $Script:PreferredGpu
 }
 
 function Get-QualityScore {
@@ -709,7 +673,7 @@ $workDir = Join-Path $tempRoot ('hardware-reencode-check-' + [guid]::NewGuid().T
 New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 
 try {
-  $plan = @(Get-SamplePlan -Duration $duration -Count $SampleCount -Seconds $SampleSeconds)
+  $plan = @(Get-SamplePlan -Duration $duration -Count $SampleCount -Seconds $SampleSeconds -CenterShortSample)
   $samples = [System.Collections.Generic.List[string]]::new()
   for ($i = 0; $i -lt $plan.Count; $i++) {
     $samplePath = Join-Path $workDir ('reference_{0}.mkv' -f $i)
