@@ -10,6 +10,11 @@
     meaningful; VMAF is used when available, otherwise SSIM. Decoding is timed
     separately with and without each advertised hardware accelerator.
 
+    Hardware encoders that require hardware frames are tested with a device and
+    upload filter. OpenCL is reported as an FFmpeg hardware API but excluded
+    from decoder tests. Unavailable device paths are skipped with a concise
+    reason; use -Verbose to see full FFmpeg diagnostics.
+
     The verdict is based on measured sample results, not a guarantee of
     full-file performance. Hardware encoder quality modes and power use vary by
     device, so test the chosen settings on your own content before batch use.
@@ -200,6 +205,60 @@ function Get-QualityScore {
   return $null
 }
 
+function Get-EncoderSetup {
+  param([Parameter(Mandatory)][string]$Encoder)
+
+  switch -Regex ($Encoder) {
+    '_(d3d12va|vaapi|vulkan)$' {
+      $deviceType = $Matches[1]
+      if ($deviceType -eq 'vaapi' -and $env:OS -eq 'Windows_NT') {
+        return [pscustomobject]@{
+          SkipReason = 'VAAPI requires a Linux DRM render device and is not available in native Windows.'
+        }
+      }
+
+      $deviceName = 'bench'
+      return [pscustomobject]@{
+        DeviceArgs = @('-init_hw_device', "$deviceType=$deviceName", '-filter_hw_device', $deviceName)
+        VideoFilter = 'format=nv12,hwupload'
+        PixelFormat = $null
+        SkipReason = $null
+      }
+    }
+    '_qsv$' {
+      $deviceName = 'bench'
+      return [pscustomobject]@{
+        DeviceArgs = @('-init_hw_device', "qsv=$deviceName", '-filter_hw_device', $deviceName)
+        VideoFilter = 'format=nv12,hwupload=extra_hw_frames=64'
+        PixelFormat = $null
+        SkipReason = $null
+      }
+    }
+    default {
+      return [pscustomobject]@{
+        DeviceArgs = @()
+        VideoFilter = $null
+        PixelFormat = 'yuv420p'
+        SkipReason = $null
+      }
+    }
+  }
+}
+
+function Get-FailureSummary {
+  param([Parameter(Mandatory)][AllowEmptyString()][string]$Output)
+
+  $relevant = @(
+    $Output -split '\r?\n' |
+    Where-Object { $_ -match '(?i)(error|failed|failure|unable|no device|not supported|unsupported|impossible|not implemented|could not|cannot)' } |
+    Select-Object -Last 4
+  )
+  if ($relevant.Count -eq 0) {
+    $relevant = @($Output -split '\r?\n' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 3)
+  }
+  return ($relevant -join ' | ')
+}
+
 function Measure-Encoder {
   param(
     [Parameter(Mandatory)][string]$Name,
@@ -214,22 +273,30 @@ function Measure-Encoder {
   $totalSeconds = 0.0
   $qualityScores = New-Object System.Collections.Generic.List[double]
   $sampleDuration = 0.0
+  $setup = Get-EncoderSetup -Encoder $Encoder
+  if ($setup.SkipReason) {
+    Write-Warning "Skipping ${Encoder}: $($setup.SkipReason)"
+    return $null
+  }
 
   for ($i = 0; $i -lt $Samples.Count; $i++) {
     $outputPath = Join-Path $WorkDir ("{0}_{1}.mkv" -f $Name, $i)
     $rate = "$($BitrateKbps)k"
-    $encodeArgs = @(
-      '-hide_banner', '-v', 'error', '-nostdin', '-y', '-i', $Samples[$i],
-      '-map', '0:v:0', '-an', '-sn', '-dn', '-c:v', $Encoder,
-      '-b:v', $rate, '-maxrate', $rate, '-bufsize', "$($BitrateKbps * 2)k",
-      '-pix_fmt', 'yuv420p', $outputPath
+    $encodeArgs = @('-hide_banner', '-v', 'error', '-nostdin', '-y') + $setup.DeviceArgs +
+      @('-i', $Samples[$i], '-map', '0:v:0', '-an', '-sn', '-dn')
+    if ($setup.VideoFilter) { $encodeArgs += @('-vf', $setup.VideoFilter) }
+    $encodeArgs += @(
+      '-c:v', $Encoder, '-b:v', $rate, '-maxrate', $rate, '-bufsize', "$($BitrateKbps * 2)k"
     )
+    if ($setup.PixelFormat) { $encodeArgs += @('-pix_fmt', $setup.PixelFormat) }
+    $encodeArgs += $outputPath
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     $run = Invoke-Native -FilePath $Script:FfmpegExe -Arguments $encodeArgs
     $timer.Stop()
 
     if ($run.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $outputPath -PathType Leaf)) {
-      Write-Warning "$Name encoder '$Encoder' failed: $($run.Output.Trim())"
+      Write-Verbose "$Name encoder full error: $($run.Output.Trim())"
+      Write-Warning "$Name encoder '$Encoder' unavailable for this run: $(Get-FailureSummary -Output $run.Output)"
       return $null
     }
 
@@ -269,6 +336,11 @@ function Measure-DecodeSpeed {
     [string]$HardwareAcceleration
   )
 
+  if ($HardwareAcceleration -eq 'vaapi' -and $env:OS -eq 'Windows_NT') {
+    Write-Warning 'Skipping VAAPI decode: VAAPI requires a Linux DRM render device and is not available in native Windows.'
+    return $null
+  }
+
   $duration = 0.0
   $seconds = 0.0
   foreach ($clip in $Plan) {
@@ -284,7 +356,8 @@ function Measure-DecodeSpeed {
     $run = Invoke-Native -FilePath $Script:FfmpegExe -Arguments $decodeArgs
     $timer.Stop()
     if ($run.ExitCode -ne 0) {
-      Write-Warning "$Label decode failed: $($run.Output.Trim())"
+      Write-Verbose "$Label decoder full error: $($run.Output.Trim())"
+      Write-Warning "$Label decode unavailable for this run: $(Get-FailureSummary -Output $run.Output)"
       return $null
     }
     $seconds += $timer.Elapsed.TotalSeconds
@@ -361,7 +434,18 @@ $hardwareAccels = @(
   ForEach-Object { $_.Groups[1].Value } |
   Sort-Object -Unique
 )
-Write-Host ('Hardware decode accelerators listed: {0}' -f $(if ($hardwareAccels.Count) { $hardwareAccels -join ', ' } else { 'none' }))
+$decodeAccels = @(
+  $hardwareAccels |
+  Where-Object { $_ -ne 'opencl' -and -not ($_ -eq 'vaapi' -and $env:OS -eq 'Windows_NT') }
+)
+Write-Host ('Hardware acceleration APIs listed by FFmpeg: {0}' -f $(if ($hardwareAccels.Count) { $hardwareAccels -join ', ' } else { 'none' }))
+Write-Host ('Decode backends to test: {0}' -f $(if ($decodeAccels.Count) { $decodeAccels -join ', ' } else { 'none' }))
+if ($hardwareAccels -contains 'opencl') {
+  Write-Host 'OpenCL is a compute/filter API, not a video decoder; skipping it in decode tests.' -ForegroundColor DarkGray
+}
+if ($hardwareAccels -contains 'vaapi' -and $env:OS -eq 'Windows_NT') {
+  Write-Host 'VAAPI needs a Linux DRM render device; skipping it in native Windows decode tests.' -ForegroundColor DarkGray
+}
 
 $filterRun = Invoke-Native -FilePath $Script:FfmpegExe -Arguments @('-hide_banner', '-filters')
 if ($filterRun.ExitCode -ne 0) { throw "Could not query FFmpeg filters: $($filterRun.Output)" }
@@ -458,7 +542,7 @@ try {
   $cpuDecode = Measure-DecodeSpeed -Label 'CPU' -InputPath $inputPath -VideoIndex $videoStream[0].index -Plan $plan
   if ($cpuDecode) { $decodeResults.Add($cpuDecode) }
   else { Write-Warning 'CPU decode baseline failed; GPU decode speedups cannot be evaluated.' }
-  foreach ($accel in $hardwareAccels) {
+  foreach ($accel in $decodeAccels) {
     $result = Measure-DecodeSpeed -Label $accel -InputPath $inputPath `
       -VideoIndex $videoStream[0].index -Plan $plan -HardwareAcceleration $accel
     if ($result) { $decodeResults.Add($result) }
