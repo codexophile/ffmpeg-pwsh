@@ -56,6 +56,7 @@
 .PARAMETER MaxHeight
     Optional maximum output height in pixels (for example 1080 or 720). Videos already at or below
     this height are not upscaled. Sample-based size and encode-time estimates include the downscale.
+    VMAF compares at output dimensions, so an intentional resolution reduction is neutral to the score.
 
 .PARAMETER SampleCount
     Number of clips to sample, spread evenly across the file. Default 5.
@@ -821,6 +822,8 @@ function Get-TriageAssessment {
         Object returned by Get-MediaInfo.
     .PARAMETER Codec
         Target codec ('x265' or 'av1').
+    .PARAMETER MaxHeight
+        Optional output height cap used for the resolution-aware triage note.
     .OUTPUTS
         [pscustomobject] with Potential (High|Medium|Low|Skip), Bpp, AudioShare, LosslessAudio, Notes[].
     #>
@@ -988,13 +991,36 @@ function Get-ClipDuration {
   return [double]$d
 }
 
+function Get-VideoDimensions {
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param([Parameter(Mandatory)][string]$LiteralPath)
+
+  $probeArgs = @('-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height',
+    '-of', 'json', $LiteralPath)
+  $raw = & $Script:FfprobeExe @probeArgs 2>$null | Out-String
+  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($raw)) {
+    throw "ffprobe could not read video dimensions from '$LiteralPath'."
+  }
+  $data = $raw | ConvertFrom-Json
+  $video = @($data.streams)[0]
+  if ($null -eq $video -or $video.width -le 0 -or $video.height -le 0) {
+    throw "No video dimensions found in '$LiteralPath'."
+  }
+  return [pscustomobject]@{
+    Width  = [int]$video.width
+    Height = [int]$video.height
+  }
+}
+
 function Measure-Vmaf {
   <#
     .SYNOPSIS
         Computes per-frame VMAF scores of an encoded clip against its reference clip.
     .DESCRIPTION
-        When the sample was downscaled, the encoded clip is upscaled to the source dimensions before
-        comparison so VMAF includes the resolution loss. Both inputs are converted to yuv420p10le.
+        The source reference is resized to the encoded clip dimensions before comparison. This keeps
+        intentional resolution reduction neutral to VMAF, which then evaluates encoding quality at the
+        selected output dimensions. Both inputs are converted to yuv420p10le.
         The log is written to a relative path inside WorkDir to avoid Windows drive-letter escaping in filters.
     .PARAMETER Distorted
         Encoded clip (first input).
@@ -1012,17 +1038,18 @@ function Measure-Vmaf {
     [Parameter(Mandatory)][string]$Reference,
     [Parameter(Mandatory)][string]$WorkDir,
     [Parameter(Mandatory)][pscustomobject]$Info,
-    [int]$MaxHeight = 0
+    [Parameter(Mandatory)][int]$OutputWidth,
+    [Parameter(Mandatory)][int]$OutputHeight
   )
   $logName = 'vmaf.json'
   $logPath = Join-Path $WorkDir $logName
   if (Test-Path -LiteralPath $logPath) { Remove-Item -LiteralPath $logPath -Force }
   $threads = [Environment]::ProcessorCount
-  $scale = if ($MaxHeight -gt 0 -and $Info.Height -gt $MaxHeight) {
-    "scale=$($Info.Width):$($Info.Height):flags=bicubic,"
+  $referenceScale = if ($Info.Width -ne $OutputWidth -or $Info.Height -ne $OutputHeight) {
+    "scale=${OutputWidth}:${OutputHeight}:flags=bicubic,"
   }
   else { '' }
-  $filter = "[0:v]${scale}format=yuv420p10le,setpts=PTS-STARTPTS[d];[1:v]format=yuv420p10le,setpts=PTS-STARTPTS[r];" +
+  $filter = "[0:v]format=yuv420p10le,setpts=PTS-STARTPTS[d];[1:v]${referenceScale}format=yuv420p10le,setpts=PTS-STARTPTS[r];" +
   "[d][r]libvmaf=log_fmt=json:log_path=${logName}:n_threads=$threads"
   Push-Location -LiteralPath $WorkDir
   try {
@@ -1067,9 +1094,11 @@ function Invoke-SampleAnalysis {
         Video encoders exposed by the selected FFmpeg build.
     .PARAMETER IncludeVmaf
         Also compute VMAF.
+    .PARAMETER MaxHeight
+        Optional output height cap applied to sample encodes.
     .OUTPUTS
         [pscustomobject] with ClipCount, SrcBytes, EncBytes, SizeRatio, SrcSeconds, WallSeconds, Speed,
-        VmafMean, VmafP1, VmafMin (the VMAF values are $null if not measured).
+        source and encoded resolutions, VmafMean, VmafP1, VmafMin (the VMAF values are $null if not measured).
     #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -1091,6 +1120,7 @@ function Invoke-SampleAnalysis {
   $encArgs = @(Get-VideoEncoderArguments -Codec $Codec -Crf $Crf -Preset $Preset -Gpu $Gpu `
       -AvailableEncoders $AvailableEncoders -QuietEncoder -ScaleFilter $scaleFilter)
   $srcBytes = 0L; $encBytes = 0L; $srcSeconds = 0.0; $wall = 0.0
+  $outputResolutions = New-Object System.Collections.Generic.List[string]
   $scores = New-Object System.Collections.Generic.List[double]
   $done = 0
 
@@ -1116,15 +1146,19 @@ function Invoke-SampleAnalysis {
     $sw.Stop()
     if ($r.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $encClip)) { Write-Host " encode failed: $($r.Output)" -ForegroundColor Red; continue }
 
+    $clipDimensions = Get-VideoDimensions -LiteralPath $encClip
+    $clipResolution = '{0}x{1}' -f $clipDimensions.Width, $clipDimensions.Height
+    if (-not $outputResolutions.Contains($clipResolution)) { $outputResolutions.Add($clipResolution) }
     $s = (Get-Item -LiteralPath $srcClip).Length
     $e = (Get-Item -LiteralPath $encClip).Length
     $srcBytes += $s; $encBytes += $e; $srcSeconds += $clipSeconds; $wall += $sw.Elapsed.TotalSeconds
     $done++
-    Write-Host (' {0} -> {1} ({2:P0} of source, {3:N2}x speed)' -f (Format-FileSize $s), (Format-FileSize $e), ($e / [Math]::Max(1, $s)), ($clipSeconds / [Math]::Max(0.001, $sw.Elapsed.TotalSeconds)))
+    $sourceResolution = '{0}x{1}' -f $Info.Width, $Info.Height
+    Write-Host (' {0} -> {1} ({2:P0} of source, {3} -> {4}, {5:N2}x speed)' -f (Format-FileSize $s), (Format-FileSize $e), ($e / [Math]::Max(1, $s)), $sourceResolution, $clipResolution, ($clipSeconds / [Math]::Max(0.001, $sw.Elapsed.TotalSeconds)))
 
     if ($IncludeVmaf) {
       $clipScores = Measure-Vmaf -Distorted $encClip -Reference $srcClip -WorkDir $WorkDir `
-        -Info $Info -MaxHeight $MaxHeight
+        -Info $Info -OutputWidth $clipDimensions.Width -OutputHeight $clipDimensions.Height
       if ($clipScores) { foreach ($x in $clipScores) { $scores.Add($x) } }
     }
   }
@@ -1142,6 +1176,8 @@ function Invoke-SampleAnalysis {
     SrcBytes    = $srcBytes
     EncBytes    = $encBytes
     SizeRatio   = $encBytes / [double]$srcBytes
+    SourceResolution = '{0}x{1}' -f $Info.Width, $Info.Height
+    OutputResolution = $outputResolutions -join ', '
     SrcSeconds  = $srcSeconds
     WallSeconds = $wall
     Speed       = $srcSeconds / [Math]::Max(0.001, $wall)
@@ -1163,7 +1199,8 @@ function Get-Projection {
     .PARAMETER Sample
         Object returned by Invoke-SampleAnalysis.
     .OUTPUTS
-        [pscustomobject] with ProjectedBytes, SavedBytes, SavingsPercent, EstimatedEncodeSeconds.
+        [pscustomobject] with ProjectedBytes, SavedBytes, SavingsPercent, EstimatedEncodeSeconds,
+        SourceResolution, and ProjectedResolution.
     #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -1180,6 +1217,8 @@ function Get-Projection {
     SavedBytes             = [long]$saved
     SavingsPercent         = 100.0 * $saved / [Math]::Max(1.0, [double]$Info.FileSize)
     EstimatedEncodeSeconds = $Info.Duration / [Math]::Max(0.001, $Sample.Speed)
+    SourceResolution       = '{0}x{1}' -f $Info.Width, $Info.Height
+    ProjectedResolution    = $Sample.OutputResolution
   }
 }
 
@@ -1395,6 +1434,8 @@ function Write-NextSteps {
         Selected GPU adapter, or $null to encode on the CPU.
     .PARAMETER AvailableEncoders
         Video encoders exposed by the selected FFmpeg build.
+    .PARAMETER MaxHeight
+        Optional maximum output height passed to the suggested encode commands.
     #>
   [CmdletBinding()]
   param(
@@ -1470,12 +1511,14 @@ function Invoke-Reencode {
         Constant-quality value.
     .PARAMETER Preset
         Encoder preset.
+    .PARAMETER MaxHeight
+        Optional maximum output height for the final encode.
     .PARAMETER Gpu
         Selected GPU adapter, or $null to encode on the CPU.
     .PARAMETER AvailableEncoders
         Video encoders exposed by the selected FFmpeg build.
     .OUTPUTS
-        [pscustomobject] with Success, Path, Bytes, SavingsPercent, Seconds.
+        [pscustomobject] with Success, Path, Bytes, SavingsPercent, Seconds, and OutputResolution.
     #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -1514,12 +1557,15 @@ function Invoke-Reencode {
   if ($code -ne 0 -or -not (Test-Path -LiteralPath $OutputPath)) {
     Write-Warning "ffmpeg exited with code $code."
     if (Test-Path -LiteralPath $OutputPath) { Remove-Item -LiteralPath $OutputPath -Force -ErrorAction SilentlyContinue }
-    return [pscustomobject]@{ Success = $false; Path = $null; Bytes = 0L; SavingsPercent = 0.0; Seconds = $sw.Elapsed.TotalSeconds }
+    return [pscustomobject]@{ Success = $false; Path = $null; Bytes = 0L; SavingsPercent = 0.0; Seconds = $sw.Elapsed.TotalSeconds; OutputResolution = $null }
   }
   $bytes = (Get-Item -LiteralPath $OutputPath).Length
   $pct = 100.0 * ($Info.FileSize - $bytes) / [Math]::Max(1.0, [double]$Info.FileSize)
-  Write-Host ('    Done in {0}: {1} -> {2} ({3:N1}% smaller). Original left untouched.' -f (Format-Duration $sw.Elapsed.TotalSeconds), (Format-FileSize $Info.FileSize), (Format-FileSize $bytes), $pct) -ForegroundColor Green
-  return [pscustomobject]@{ Success = $true; Path = $OutputPath; Bytes = [long]$bytes; SavingsPercent = $pct; Seconds = $sw.Elapsed.TotalSeconds }
+  $outputDimensions = Get-VideoDimensions -LiteralPath $OutputPath
+  $sourceResolution = '{0}x{1}' -f $Info.Width, $Info.Height
+  $outputResolution = '{0}x{1}' -f $outputDimensions.Width, $outputDimensions.Height
+  Write-Host ('    Done in {0}: {1} -> {2} ({3:N1}% smaller), resolution {4} -> {5}. Original left untouched.' -f (Format-Duration $sw.Elapsed.TotalSeconds), (Format-FileSize $Info.FileSize), (Format-FileSize $bytes), $pct, $sourceResolution, $outputResolution) -ForegroundColor Green
+  return [pscustomobject]@{ Success = $true; Path = $OutputPath; Bytes = [long]$bytes; SavingsPercent = $pct; Seconds = $sw.Elapsed.TotalSeconds; OutputResolution = $outputResolution }
 }
 
 #endregion
@@ -1605,9 +1651,11 @@ foreach ($file in $files) {
       }
       Write-Host '[3] Projection and quality' -ForegroundColor Cyan
       Write-Host ('    Sample size ratio : {0:P0} of source video' -f $sample.SizeRatio)
+      Write-Host ('    Video dimensions  : {0} -> {1}' -f $projection.SourceResolution, $projection.ProjectedResolution)
       Write-Host ('    Projected file    : {0} -> {1}  ({2:N0}% smaller, saves {3})' -f (Format-FileSize $info.FileSize), (Format-FileSize $projection.ProjectedBytes), $projection.SavingsPercent, (Format-FileSize $projection.SavedBytes))
       Write-Host ('    Encode speed      : {0:N2}x realtime -> about {1} for the full file' -f $sample.Speed, (Format-Duration $projection.EstimatedEncodeSeconds))
       if ($null -ne $sample.VmafMean) {
+        Write-Host ('    VMAF comparison   : {0} (source resized to match; resolution change is neutral)' -f $sample.OutputResolution)
         Write-Host ('    VMAF              : mean {0:N2}, 1st percentile {1:N1}, min {2:N1}' -f $sample.VmafMean, $sample.VmafP1, $sample.VmafMin)
       }
     }
@@ -1643,6 +1691,7 @@ foreach ($file in $files) {
         SizeBytes           = $info.FileSize
         Codec               = $info.Codec
         Resolution          = ('{0}x{1}' -f $info.Width, $info.Height)
+        ProjectedResolution = $(if ($projection) { $projection.ProjectedResolution } else { $null })
         MaxOutputHeight     = $(if ($MaxHeight -gt 0) { $MaxHeight } else { $null })
         DurationSeconds     = [Math]::Round($info.Duration, 1)
         VideoKbps           = [Math]::Round($info.VideoBitrate / 1000)
@@ -1658,6 +1707,7 @@ foreach ($file in $files) {
         Reasons             = ($verdict.Reasons -join ' | ')
         Reencoded           = [bool]($enc -and $enc.Success)
         OutputPath          = $(if ($enc -and $enc.Success) { $enc.Path } else { $null })
+        ActualOutputResolution = $(if ($enc -and $enc.Success) { $enc.OutputResolution } else { $null })
         ActualSavingsPct    = $(if ($enc -and $enc.Success) { [Math]::Round($enc.SavingsPercent, 1) } else { $null })
       })
   }
@@ -1669,7 +1719,20 @@ foreach ($file in $files) {
 if ($results.Count -gt 0) {
   Write-Host ''
   Write-Host '=== Summary' -ForegroundColor White
-  $results | Select-Object @{n = 'File'; e = { Split-Path -Leaf $_.Path } }, Codec, Resolution, Potential, ProjectedSavingsPct, ProjectedSavedMB, EstEncodeMinutes, VmafMean, Verdict, Reencoded |
+  $results | Select-Object @{n = 'File'; e = {
+      $fileName = Split-Path -Leaf $_.Path
+      if ($fileName.Length -gt 32) {
+        $extension = [System.IO.Path]::GetExtension($fileName)
+        $prefixLength = 29 - $extension.Length
+        $fileName = if ($prefixLength -gt 0) {
+          $fileName.Substring(0, $prefixLength) + '...' + $extension
+        }
+        else {
+          $fileName.Substring(0, 29) + '...'
+        }
+      }
+      $fileName
+    } }, Codec, Resolution, ProjectedResolution, Potential, ProjectedSavingsPct, ProjectedSavedMB, EstEncodeMinutes, VmafMean, Verdict, Reencoded |
     Format-Table -AutoSize | Out-Host
   if ($ReportPath) {
     $results | Export-Csv -LiteralPath $ReportPath -NoTypeInformation -Encoding UTF8
