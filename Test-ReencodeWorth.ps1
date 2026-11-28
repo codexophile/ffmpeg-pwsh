@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Decides whether re-encoding a video file (or folder of videos) to HEVC or AV1 is worth the time and quality cost.
@@ -19,7 +19,9 @@
 
     Requirements (all free):  winget install Gyan.FFmpeg   (the "full" build includes libx265, libsvtav1, libvmaf)
     Optional: HandBrakeCLI (only used to print equivalent arguments).
-    Requires PowerShell 7.0 or later.
+
+    This file must stay ASCII / UTF-8 with BOM if you edit it in an editor that changes encodings, because
+    Windows PowerShell 5.1 misreads BOM-less UTF-8 containing non-ASCII characters.
 
 .PARAMETER Path
     One or more video files, folders, or wildcard patterns. Folders are scanned for common video extensions.
@@ -34,7 +36,16 @@
     Run the sample encode but skip the VMAF quality measurement.
 
 .PARAMETER Codec
-    Target codec: 'x265' (HEVC, default) or 'av1' (SVT-AV1).
+    Target codec: 'x265' (HEVC, default) or 'av1'. CPU encodes use libx265/SVT-AV1; GPU encodes use the
+    matching hardware encoder available for the selected adapter.
+
+.PARAMETER UseGpu
+    Use a supported GPU video encoder for sample and final encodes instead of the CPU encoder. Hardware
+    encoders interpret quality and preset values differently, so use the sample/VMAF results to judge output.
+
+.PARAMETER Gpu
+    Exact Windows display-adapter name to use with -UseGpu. If omitted, the adapter with the most
+    reported dedicated memory is selected. If tied, selection fails rather than guessing.
 
 .PARAMETER Crf
     Constant quality value. Defaults: 20 for x265, 27 for av1. Lower = better quality / bigger file.
@@ -98,6 +109,14 @@
     Analyze with SVT-AV1, then prompt before encoding.
 
 .EXAMPLE
+    .\Test-ReencodeWorth.ps1 'D:\Movies\Film.mkv' -UseGpu -Reencode
+    Analyze and encode using the most powerful GPU detected on Windows.
+
+.EXAMPLE
+    .\Test-ReencodeWorth.ps1 'D:\Movies\Film.mkv' -UseGpu -Gpu 'NVIDIA GeForce RTX 4080'
+    Use the named GPU for sample encodes; analysis still runs without modifying the source.
+
+.EXAMPLE
     .\Test-ReencodeWorth.ps1 'D:\Rips' -Recurse -Reencode -Confirm:$false -OutputDir 'E:\Encoded' -ReportPath .\report.csv
     Unattended: encode everything that is worth it (or marginal) and write a CSV report.
 
@@ -116,6 +135,9 @@ param(
 
   [ValidateSet('x265', 'av1')]
   [string]$Codec = 'x265',
+
+  [switch]$UseGpu,
+  [ValidateNotNullOrEmpty()][string]$Gpu,
 
   [ValidateRange(0, 63)]
   [int]$Crf,
@@ -150,6 +172,8 @@ param(
 
 Set-StrictMode -Version 1.0
 $ErrorActionPreference = 'Stop'
+$Script:SelectedGpu = $null
+if ($Gpu -and -not $UseGpu) { throw '-Gpu can only be used together with -UseGpu.' }
 
 #region Constants
 
@@ -310,10 +334,28 @@ function Invoke-Native {
     [Parameter(Mandatory, Position = 0)][string]$FilePath,
     [Parameter(Mandatory, Position = 1)][string[]]$Arguments
   )
+  $oldPreference = $ErrorActionPreference
+  $oldCudaDeviceOrder = $env:CUDA_DEVICE_ORDER
+  if ($Script:SelectedGpu -and $Script:SelectedGpu.VendorId -eq '10de' -and
+      $null -ne $Script:SelectedGpu.NvidiaIndex) {
+    $env:CUDA_DEVICE_ORDER = 'PCI_BUS_ID'
+  }
   $ErrorActionPreference = 'Continue'
-  $lines = & $FilePath @Arguments 2>&1 | ForEach-Object { "$_" }
+  try {
+    $lines = & $FilePath @Arguments 2>&1 | ForEach-Object { "$_" }
+    $exitCode = $LASTEXITCODE
+  }
+  finally {
+    $ErrorActionPreference = $oldPreference
+    if ($null -eq $oldCudaDeviceOrder) {
+      Remove-Item Env:CUDA_DEVICE_ORDER -ErrorAction SilentlyContinue
+    }
+    else {
+      $env:CUDA_DEVICE_ORDER = $oldCudaDeviceOrder
+    }
+  }
   return [pscustomobject]@{
-    ExitCode = $LASTEXITCODE
+    ExitCode = $exitCode
     Output   = ($lines -join "`n")
   }
 }
@@ -379,11 +421,252 @@ function Get-FfmpegCapabilities {
   param()
   $enc = (Invoke-Native -FilePath $Script:FfmpegExe -Arguments @('-hide_banner', '-encoders')).Output
   $flt = (Invoke-Native -FilePath $Script:FfmpegExe -Arguments @('-hide_banner', '-filters')).Output
+  $videoEncoders = @(
+    [regex]::Matches($enc, '^\s*V\S*\s+(\S+)', [System.Text.RegularExpressions.RegexOptions]::Multiline) |
+      ForEach-Object { $_.Groups[1].Value }
+  )
   return [pscustomobject]@{
-    Libx265 = [bool]($enc -match '\blibx265\b')
-    SvtAv1  = [bool]($enc -match '\blibsvtav1\b')
-    Libvmaf = [bool]($flt -match '\blibvmaf\b')
+    Libx265       = [bool]($enc -match '\blibx265\b')
+    SvtAv1        = [bool]($enc -match '\blibsvtav1\b')
+    Libvmaf       = [bool]($flt -match '\blibvmaf\b')
+    VideoEncoders = $videoEncoders
   }
+}
+
+function Get-SelectedGpu {
+  <#
+    .SYNOPSIS
+        Selects a Windows display adapter by exact name or by reported dedicated memory.
+    .PARAMETER Name
+        Optional exact display-adapter name.
+    .OUTPUTS
+        [pscustomobject] with adapter identity, vendor, and NVIDIA encoder index.
+    #>
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param([string]$Name)
+
+  if ($env:OS -ne 'Windows_NT') {
+    throw 'GPU selection currently requires Windows display-adapter detection.'
+  }
+
+  try {
+    $controllers = New-Object System.Collections.Generic.List[object]
+    foreach ($controller in @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)) {
+      if ($controller.PNPDeviceID -match '^PCI\\VEN_([0-9A-Fa-f]{4})&') {
+        $adapterRam = [uint64]$controller.AdapterRAM
+        if ($adapterRam -gt 0) {
+          $controllers.Add([pscustomobject]@{
+              Name       = [string]$controller.Name
+              VendorId   = $Matches[1].ToLowerInvariant()
+              AdapterRam = $adapterRam
+            })
+        }
+      }
+    }
+  }
+  catch {
+    throw "Could not enumerate Windows display adapters needed for GPU selection: $($_.Exception.Message)"
+  }
+  if ($controllers.Count -eq 0) {
+    throw 'Windows did not report a PCI display adapter with dedicated memory; cannot select a GPU safely.'
+  }
+
+  if ($Name) {
+    $namedControllers = @($controllers | Where-Object { $_.Name -ieq $Name })
+    if ($namedControllers.Count -ne 1) {
+      $available = ($controllers.Name | Sort-Object -Unique) -join '; '
+      if ($namedControllers.Count -gt 1) { throw "More than one display adapter is named '$Name'; selection is ambiguous." }
+      throw "No display adapter exactly matches '$Name'. Available adapters: $available"
+    }
+    $gpu = $namedControllers[0]
+  }
+  else {
+    $maximumRam = ($controllers | Measure-Object -Property AdapterRam -Maximum).Maximum
+    $topControllers = @($controllers | Where-Object { $_.AdapterRam -eq $maximumRam })
+    if ($topControllers.Count -ne 1) {
+      throw 'Windows reported multiple top-ranked GPUs with equal dedicated memory; specify -Gpu with an exact adapter name.'
+    }
+    $gpu = $topControllers[0]
+  }
+
+  if ($gpu.VendorId -notin @('10de', '1002', '8086')) {
+    throw "The selected GPU '$($gpu.Name)' has unsupported vendor ID 0x$($gpu.VendorId). Supported vendors are NVIDIA, AMD, and Intel."
+  }
+
+  $vendorCount = @($controllers | Where-Object { $_.VendorId -eq $gpu.VendorId }).Count
+  $nvidiaIndex = $null
+  if ($gpu.VendorId -eq '10de') {
+    if (Test-Path Env:CUDA_VISIBLE_DEVICES) {
+      throw 'CUDA_VISIBLE_DEVICES is set, so the selected NVIDIA adapter cannot be safely mapped to FFmpeg device indices.'
+    }
+    $smiPath = (Get-Command 'nvidia-smi.exe' -ErrorAction SilentlyContinue).Source
+    if (-not $smiPath -and $env:ProgramFiles) {
+      $knownSmiPath = Join-Path $env:ProgramFiles 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'
+      if (Test-Path -LiteralPath $knownSmiPath -PathType Leaf) { $smiPath = $knownSmiPath }
+    }
+
+    if ($smiPath) {
+      $oldPreference = $ErrorActionPreference
+      $ErrorActionPreference = 'Continue'
+      try {
+        $smiLines = @(& $smiPath '--query-gpu=index,name,memory.total' '--format=csv,noheader,nounits' 2>&1)
+        $smiExitCode = $LASTEXITCODE
+      }
+      finally { $ErrorActionPreference = $oldPreference }
+
+      if ($smiExitCode -eq 0) {
+        $nvidiaGpus = @(
+          foreach ($line in $smiLines) {
+            if ("$line" -match '^\s*(\d+)\s*,\s*(.*?)\s*,\s*(\d+)\s*$') {
+              [pscustomobject]@{
+                Index     = [int]$Matches[1]
+                Name      = $Matches[2]
+                MemoryMiB = [uint64]$Matches[3]
+              }
+            }
+          }
+        )
+        $namedNvidiaGpus = @($nvidiaGpus | Where-Object { $_.Name -ieq $gpu.Name })
+        if ($namedNvidiaGpus.Count -eq 1) { $nvidiaIndex = $namedNvidiaGpus[0].Index }
+        elseif ($namedNvidiaGpus.Count -gt 1) {
+          $memoryMatches = @($namedNvidiaGpus | Where-Object {
+              [Math]::Abs([double]$_.MemoryMiB - ($gpu.AdapterRam / 1MB)) -lt 256
+            })
+          if ($memoryMatches.Count -eq 1) { $nvidiaIndex = $memoryMatches[0].Index }
+        }
+      }
+    }
+    if ($null -eq $nvidiaIndex -and $vendorCount -eq 1) { $nvidiaIndex = 0 }
+    if ($null -eq $nvidiaIndex) {
+      throw "Could not safely map '$($gpu.Name)' to an NVIDIA FFmpeg device index. Verify nvidia-smi and select a uniquely identifiable adapter."
+    }
+  }
+
+  return [pscustomobject]@{
+    Name        = $gpu.Name
+    VendorId    = $gpu.VendorId
+    AdapterRam  = $gpu.AdapterRam
+    VendorCount = $vendorCount
+    NvidiaIndex = $nvidiaIndex
+  }
+}
+
+function Get-ProcessorName {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param()
+
+  try {
+    $names = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop |
+      ForEach-Object { $_.Name.Trim() } | Where-Object { $_ })
+  }
+  catch {
+    throw "Could not identify the CPU for the processing-device report: $($_.Exception.Message)"
+  }
+  if ($names.Count -eq 0) {
+    throw 'Windows did not report a CPU model; cannot display the processing device.'
+  }
+  return ($names -join ', ')
+}
+
+function Get-GpuDeviceArguments {
+  [CmdletBinding()]
+  [OutputType([string[]])]
+  param([Parameter(Mandatory)][pscustomobject]$Gpu)
+
+  switch ($Gpu.VendorId) {
+    '8086' {
+      if ($Gpu.VendorCount -gt 1) {
+        throw "Multiple Intel GPUs are present, and FFmpeg cannot unambiguously pin QSV to '$($Gpu.Name)'."
+      }
+      return @(
+        '-init_hw_device', "d3d11va=preferred:,vendor_id=0x$($Gpu.VendorId)",
+        '-init_hw_device', 'qsv=encode@preferred', '-filter_hw_device', 'encode'
+      )
+    }
+    '1002' {
+      if ($Gpu.VendorCount -gt 1) {
+        throw "Multiple AMD GPUs are present, and FFmpeg cannot unambiguously pin AMF to '$($Gpu.Name)'."
+      }
+      return @(
+        '-init_hw_device', "d3d11va=preferred:,vendor_id=0x$($Gpu.VendorId)",
+        '-init_hw_device', 'amf=encode@preferred', '-filter_hw_device', 'encode'
+      )
+    }
+    default { return @() }
+  }
+}
+
+function Get-GpuVideoEncoderArguments {
+  [CmdletBinding()]
+  [OutputType([string[]])]
+  param(
+    [Parameter(Mandatory)][pscustomobject]$Gpu,
+    [Parameter(Mandatory)][string]$Codec,
+    [Parameter(Mandatory)][int]$Crf,
+    [Parameter(Mandatory)][string]$Preset,
+    [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$AvailableEncoders
+  )
+
+  $encoder = switch ($Gpu.VendorId) {
+    '10de' { if ($Codec -eq 'x265') { 'hevc_nvenc' } else { 'av1_nvenc' } }
+    '1002' { if ($Codec -eq 'x265') { 'hevc_amf' } else { 'av1_amf' } }
+    '8086' { if ($Codec -eq 'x265') { 'hevc_qsv' } else { 'av1_qsv' } }
+  }
+  if ($AvailableEncoders -notcontains $encoder) {
+    throw "FFmpeg does not provide '$encoder' for the selected GPU. Verify the adapter supports $Codec hardware encoding and use an FFmpeg build with that encoder."
+  }
+
+  if ($Gpu.VendorId -eq '10de') {
+    if ($null -eq $Gpu.NvidiaIndex) { throw "Could not determine the NVIDIA adapter index for '$($Gpu.Name)'." }
+    if ($Codec -eq 'x265') {
+      $presetRanks = @{
+        ultrafast = 1; superfast = 2; veryfast = 3; faster = 4; fast = 4
+        medium = 5; slow = 6; slower = 7; veryslow = 7; placebo = 7
+      }
+      $presetRank = $presetRanks[$Preset]
+    }
+    else {
+      $presetRank = [Math]::Max(1, [Math]::Min(7, 7 - [int][Math]::Round([int]$Preset * 6 / 13)))
+    }
+    return @('-c:v', $encoder, '-preset', "p$presetRank", '-rc', 'vbr', '-cq', "$Crf", '-b:v', '0',
+      '-gpu', [string]$Gpu.NvidiaIndex, '-pix_fmt', 'yuv420p')
+  }
+  if ($Gpu.VendorId -eq '1002') {
+    if ($Codec -eq 'x265') {
+      $quality = if ($Preset -in @('ultrafast', 'superfast', 'veryfast', 'faster', 'fast')) {
+        'speed'
+      }
+      elseif ($Preset -eq 'medium') { 'balanced' }
+      else { 'quality' }
+    }
+    else {
+      if ([int]$Preset -ge 9) { $quality = 'speed' }
+      elseif ([int]$Preset -ge 5) { $quality = 'balanced' }
+      else { $quality = 'quality' }
+    }
+    return @('-c:v', $encoder, '-quality', $quality, '-rc', 'cqp', '-qp_i', "$Crf", '-qp_p', "$Crf",
+      '-vf', 'format=nv12,hwupload')
+  }
+
+  if ($Codec -eq 'x265') {
+    $qsvPresets = @{
+      ultrafast = 'veryfast'; superfast = 'veryfast'; veryfast = 'veryfast'; faster = 'faster'
+      fast = 'fast'; medium = 'medium'; slow = 'slow'; slower = 'slower'; veryslow = 'veryslow'; placebo = 'veryslow'
+    }
+    $qsvPreset = $qsvPresets[$Preset]
+  }
+  else {
+    $presetValue = [int]$Preset
+    if ($presetValue -ge 10) { $qsvPreset = 'veryfast' }
+    elseif ($presetValue -ge 7) { $qsvPreset = 'faster' }
+    elseif ($presetValue -ge 4) { $qsvPreset = 'medium' }
+    elseif ($presetValue -ge 2) { $qsvPreset = 'slow' }
+    else { $qsvPreset = 'veryslow' }
+  }
+  return @('-c:v', $encoder, '-preset', $qsvPreset, '-global_quality', "$Crf",
+    '-vf', 'format=nv12,hwupload=extra_hw_frames=64')
 }
 
 #endregion
@@ -407,7 +690,7 @@ function Get-VideoFiles {
     [Parameter(Mandatory, Position = 0)][string[]]$Paths,
     [Parameter(Position = 1)][switch]$Recurse
   )
-  $found = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+  $found = New-Object System.Collections.Generic.List[System.IO.FileInfo]
   foreach ($p in $Paths) {
     $items = @()
     if (Test-Path -LiteralPath $p) { $items = @(Get-Item -LiteralPath $p) }
@@ -539,7 +822,7 @@ function Get-TriageAssessment {
     [Parameter(Mandatory, Position = 0)][pscustomobject]$Info,
     [Parameter(Mandatory, Position = 1)][ValidateSet('x265', 'av1')][string]$Codec
   )
-  $notes = [System.Collections.Generic.List[string]]::new()
+  $notes = New-Object System.Collections.Generic.List[string]
   $pixels = [double]$Info.Width * $Info.Height
   $bpp = 0.0
   if ($pixels -gt 0 -and $Info.Fps -gt 0) { $bpp = $Info.VideoBitrate / ($pixels * $Info.Fps) }
@@ -631,6 +914,10 @@ function Get-VideoEncoderArguments {
         Encoder preset.
     .PARAMETER QuietEncoder
         Suppress x265's own log output (used for sample encodes).
+    .PARAMETER Gpu
+        Selected GPU adapter, or $null to use the CPU.
+    .PARAMETER AvailableEncoders
+        Video encoders exposed by the selected FFmpeg build.
     .OUTPUTS
         [string[]]
     #>
@@ -640,8 +927,14 @@ function Get-VideoEncoderArguments {
     [Parameter(Mandatory)][ValidateSet('x265', 'av1')][string]$Codec,
     [Parameter(Mandatory)][int]$Crf,
     [Parameter(Mandatory)][string]$Preset,
+    [AllowNull()][pscustomobject]$Gpu,
+    [string[]]$AvailableEncoders = @(),
     [switch]$QuietEncoder
   )
+  if ($Gpu) {
+    return @(Get-GpuVideoEncoderArguments -Gpu $Gpu -Codec $Codec -Crf $Crf `
+        -Preset $Preset -AvailableEncoders $AvailableEncoders)
+  }
   if ($Codec -eq 'x265') {
     $a = @('-c:v', 'libx265', '-preset', $Preset, '-crf', "$Crf", '-pix_fmt', 'yuv420p10le')
     if ($QuietEncoder) { $a += @('-x265-params', 'log-level=error') }
@@ -772,6 +1065,10 @@ function Invoke-SampleAnalysis {
         Number of clips.
     .PARAMETER SampleSeconds
         Length of each clip.
+    .PARAMETER Gpu
+        Selected GPU adapter, or $null to encode on the CPU.
+    .PARAMETER AvailableEncoders
+        Video encoders exposed by the selected FFmpeg build.
     .PARAMETER IncludeVmaf
         Also compute VMAF.
     .OUTPUTS
@@ -788,12 +1085,15 @@ function Invoke-SampleAnalysis {
     [Parameter(Mandatory)][string]$WorkDir,
     [Parameter(Mandatory)][int]$SampleCount,
     [Parameter(Mandatory)][int]$SampleSeconds,
+    [AllowNull()][pscustomobject]$Gpu,
+    [string[]]$AvailableEncoders = @(),
     [bool]$IncludeVmaf = $true
   )
   $plan = @(Get-SamplePlan -Duration $Info.Duration -Count $SampleCount -Seconds $SampleSeconds)
-  $encArgs = @(Get-VideoEncoderArguments -Codec $Codec -Crf $Crf -Preset $Preset -QuietEncoder)
+  $encArgs = @(Get-VideoEncoderArguments -Codec $Codec -Crf $Crf -Preset $Preset -Gpu $Gpu `
+      -AvailableEncoders $AvailableEncoders -QuietEncoder)
   $srcBytes = 0L; $encBytes = 0L; $srcSeconds = 0.0; $wall = 0.0
-  $scores = [System.Collections.Generic.List[double]]::new()
+  $scores = New-Object System.Collections.Generic.List[double]
   $done = 0
 
   Write-Host ('[2] Sample encode: {0} clip(s) x {1}s, {2} CRF {3} preset {4}' -f $plan.Count, $SampleSeconds, $Codec, $Crf, $Preset) -ForegroundColor Cyan
@@ -810,7 +1110,9 @@ function Invoke-SampleAnalysis {
     if ($r.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $srcClip)) { Write-Host ' extract failed, skipped' -ForegroundColor Red; continue }
     $clipSeconds = Get-ClipDuration -LiteralPath $srcClip -Fallback $clip.Length
 
-    $encode = @('-y', '-v', 'error', '-nostdin', '-i', $srcClip, '-map', '0:v:0') + $encArgs + @('-an', '-sn', '-dn', $encClip)
+    $deviceArgs = if ($Gpu) { @(Get-GpuDeviceArguments -Gpu $Gpu) } else { @() }
+    $encode = @('-y', '-v', 'error', '-nostdin') + $deviceArgs +
+      @('-i', $srcClip, '-map', '0:v:0') + $encArgs + @('-an', '-sn', '-dn', $encClip)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $r = Invoke-Native -FilePath $Script:FfmpegExe -Arguments $encode
     $sw.Stop()
@@ -915,7 +1217,7 @@ function Get-Verdict {
     [Parameter(Mandatory)][double]$MinVmaf,
     [Parameter(Mandatory)][int]$MinSavedMB
   )
-  $reasons = [System.Collections.Generic.List[string]]::new()
+  $reasons = New-Object System.Collections.Generic.List[string]
   $fail = $false; $marginal = $false
 
   if ($null -eq $Sample -or $null -eq $Projection) {
@@ -993,6 +1295,10 @@ function Get-FfmpegReencodeArguments {
         Constant-quality value.
     .PARAMETER Preset
         Encoder preset.
+    .PARAMETER Gpu
+        Selected GPU adapter, or $null to encode on the CPU.
+    .PARAMETER AvailableEncoders
+        Video encoders exposed by the selected FFmpeg build.
     .OUTPUTS
         [string[]]
     #>
@@ -1003,14 +1309,18 @@ function Get-FfmpegReencodeArguments {
     [Parameter(Mandatory)][string]$OutputPath,
     [Parameter(Mandatory)][string]$Codec,
     [Parameter(Mandatory)][int]$Crf,
-    [Parameter(Mandatory)][string]$Preset
+    [Parameter(Mandatory)][string]$Preset,
+    [AllowNull()][pscustomobject]$Gpu,
+    [string[]]$AvailableEncoders = @()
   )
   $subCodec = if ($Info.SubtitleCodecs -contains 'mov_text') { 'srt' } else { 'copy' }
-  $a = @('-hide_banner', '-n', '-i', $Info.Path,
+  $deviceArgs = if ($Gpu) { @(Get-GpuDeviceArguments -Gpu $Gpu) } else { @() }
+  $a = @('-hide_banner', '-n') + $deviceArgs + @('-i', $Info.Path,
     '-map', '0:V', '-map', '0:a?', '-map', '0:s?', '-map', '0:t?',
     '-map_metadata', '0', '-map_chapters', '0',
     '-c', 'copy')
-  $a += @(Get-VideoEncoderArguments -Codec $Codec -Crf $Crf -Preset $Preset)
+  $a += @(Get-VideoEncoderArguments -Codec $Codec -Crf $Crf -Preset $Preset -Gpu $Gpu `
+      -AvailableEncoders $AvailableEncoders)
   $a += @('-c:s', $subCodec, $OutputPath)
   return $a
 }
@@ -1070,6 +1380,10 @@ function Write-NextSteps {
         Planned output path.
     .PARAMETER MinVmaf
         VMAF target used for tuning advice.
+    .PARAMETER Gpu
+        Selected GPU adapter, or $null to encode on the CPU.
+    .PARAMETER AvailableEncoders
+        Video encoders exposed by the selected FFmpeg build.
     #>
   [CmdletBinding()]
   param(
@@ -1082,7 +1396,9 @@ function Write-NextSteps {
     [Parameter(Mandatory)][int]$Crf,
     [Parameter(Mandatory)][string]$Preset,
     [Parameter(Mandatory)][string]$OutputPath,
-    [Parameter(Mandatory)][double]$MinVmaf
+    [Parameter(Mandatory)][double]$MinVmaf,
+    [AllowNull()][pscustomobject]$Gpu,
+    [string[]]$AvailableEncoders = @()
   )
   Write-Host '[4] Next steps' -ForegroundColor Cyan
 
@@ -1099,7 +1415,8 @@ function Write-NextSteps {
     Write-Host '    - Eyeball dark scenes, gradients and grain in mpv; use -KeepSamples to inspect the clips.'
   }
 
-  $ff = Get-FfmpegReencodeArguments -Info $Info -OutputPath $OutputPath -Codec $Codec -Crf $Crf -Preset $Preset
+  $ff = Get-FfmpegReencodeArguments -Info $Info -OutputPath $OutputPath -Codec $Codec -Crf $Crf -Preset $Preset `
+    -Gpu $Gpu -AvailableEncoders $AvailableEncoders
   Write-Host ''
   Write-Host '    ffmpeg:' -ForegroundColor Yellow
   Write-Host ('      ' + (Format-CommandLine -Executable 'ffmpeg' -Arguments $ff))
@@ -1112,6 +1429,7 @@ function Write-NextSteps {
   }
   Write-Host ''
   Write-Host '    HandBrakeCLI (or set the same values in the GUI):' -ForegroundColor Yellow
+  if ($Gpu) { Write-Host '      Note: this HandBrakeCLI example uses its CPU encoder; use the ffmpeg command above for GPU encoding.' -ForegroundColor DarkGray }
   $hb = Get-HandBrakeArguments -Info $Info -OutputPath $OutputPath -Codec $Codec -Crf $Crf -Preset $Preset
   Write-Host ('      ' + (Format-CommandLine -Executable 'HandBrakeCLI' -Arguments $hb))
   if (-not $Script:HandBrakeExe) { Write-Host '      (HandBrakeCLI not found on this PC; download it from handbrake.fr, or use the GUI with the same settings.)' -ForegroundColor DarkGray }
@@ -1139,6 +1457,10 @@ function Invoke-Reencode {
         Constant-quality value.
     .PARAMETER Preset
         Encoder preset.
+    .PARAMETER Gpu
+        Selected GPU adapter, or $null to encode on the CPU.
+    .PARAMETER AvailableEncoders
+        Video encoders exposed by the selected FFmpeg build.
     .OUTPUTS
         [pscustomobject] with Success, Path, Bytes, SavingsPercent, Seconds.
     #>
@@ -1149,13 +1471,19 @@ function Invoke-Reencode {
     [Parameter(Mandatory)][string]$OutputPath,
     [Parameter(Mandatory)][string]$Codec,
     [Parameter(Mandatory)][int]$Crf,
-    [Parameter(Mandatory)][string]$Preset
+    [Parameter(Mandatory)][string]$Preset,
+    [AllowNull()][pscustomobject]$Gpu,
+    [string[]]$AvailableEncoders = @()
   )
-  $ffArgs = @(Get-FfmpegReencodeArguments -Info $Info -OutputPath $OutputPath -Codec $Codec -Crf $Crf -Preset $Preset)
+  $ffArgs = @(Get-FfmpegReencodeArguments -Info $Info -OutputPath $OutputPath -Codec $Codec -Crf $Crf -Preset $Preset `
+      -Gpu $Gpu -AvailableEncoders $AvailableEncoders)
   $ffArgs = @('-loglevel', 'warning', '-stats') + $ffArgs
-  Write-Host "[5] Re-encoding to $OutputPath" -ForegroundColor Cyan
+  $backend = if ($Gpu) { "GPU '$($Gpu.Name)'" } else { 'CPU' }
+  Write-Host "[5] Re-encoding to $OutputPath using $backend" -ForegroundColor Cyan
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $oldPreference = $ErrorActionPreference
+  $oldCudaDeviceOrder = $env:CUDA_DEVICE_ORDER
+  if ($Gpu -and $Gpu.VendorId -eq '10de') { $env:CUDA_DEVICE_ORDER = 'PCI_BUS_ID' }
   try {
     $ErrorActionPreference = 'Continue'
     & $Script:FfmpegExe @ffArgs
@@ -1163,6 +1491,8 @@ function Invoke-Reencode {
   }
   finally {
     $ErrorActionPreference = $oldPreference
+    if ($null -eq $oldCudaDeviceOrder) { Remove-Item Env:CUDA_DEVICE_ORDER -ErrorAction SilentlyContinue }
+    else { $env:CUDA_DEVICE_ORDER = $oldCudaDeviceOrder }
   }
   $sw.Stop()
   Write-Host ''
@@ -1193,8 +1523,8 @@ if (-not $Script:FfmpegExe -or -not $Script:FfprobeExe) {
 }
 
 $caps = Get-FfmpegCapabilities
-if ($Codec -eq 'x265' -and -not $caps.Libx265) { throw 'This ffmpeg build lacks libx265. Install the Gyan "full" build.' }
-if ($Codec -eq 'av1' -and -not $caps.SvtAv1) { throw 'This ffmpeg build lacks libsvtav1. Install the Gyan "full" build.' }
+if (-not $UseGpu -and $Codec -eq 'x265' -and -not $caps.Libx265) { throw 'This ffmpeg build lacks libx265. Install the Gyan "full" build.' }
+if (-not $UseGpu -and $Codec -eq 'av1' -and -not $caps.SvtAv1) { throw 'This ffmpeg build lacks libsvtav1. Install the Gyan "full" build.' }
 if (-not $SkipSample -and -not $SkipVmaf -and -not $caps.Libvmaf) {
   Write-Warning 'This ffmpeg build lacks libvmaf; quality verification will be skipped. The Gyan "full" build includes it.'
   $SkipVmaf = $true
@@ -1205,6 +1535,18 @@ if (-not $Preset) { $Preset = $(if ($Codec -eq 'x265') { 'slow' } else { '5' }) 
 if ($Codec -eq 'x265' -and $Script:X265Presets -notcontains $Preset) { throw "Invalid x265 preset '$Preset'. Use one of: $($Script:X265Presets -join ', ')" }
 if ($Codec -eq 'av1' -and -not ($Preset -match '^\d+$' -and [int]$Preset -le 13)) { throw "Invalid SVT-AV1 preset '$Preset'. Use 0-13." }
 
+$cpuName = Get-ProcessorName
+$selectedGpu = $null
+$gpuEncoderName = $null
+if ($UseGpu) {
+  $selectedGpu = Get-SelectedGpu -Name $Gpu
+  $Script:SelectedGpu = $selectedGpu
+  $gpuEncoderArgs = @(Get-GpuVideoEncoderArguments -Gpu $selectedGpu -Codec $Codec -Crf $Crf `
+      -Preset $Preset -AvailableEncoders $caps.VideoEncoders)
+  $gpuEncoderName = $gpuEncoderArgs[1]
+  $null = Get-GpuDeviceArguments -Gpu $selectedGpu
+}
+
 if ($OutputDir -and -not (Test-Path -LiteralPath $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
 $tempRoot = if ($TempDir) { $TempDir } else { [System.IO.Path]::GetTempPath() }
 if (-not (Test-Path -LiteralPath $tempRoot)) { New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null }
@@ -1212,8 +1554,15 @@ if (-not (Test-Path -LiteralPath $tempRoot)) { New-Item -ItemType Directory -Pat
 $files = @(Get-VideoFiles -Paths $Path -Recurse:$Recurse)
 if ($files.Count -eq 0) { throw 'No video files found.' }
 Write-Host ('Analyzing {0} file(s): {1} CRF {2} preset {3}{4}' -f $files.Count, $Codec, $Crf, $Preset, $(if ($SkipSample) { ' (triage only)' } else { '' })) -ForegroundColor White
+Write-Host "CPU: $cpuName" -ForegroundColor DarkGray
+if ($selectedGpu) {
+  Write-Host ('Encoding backend: GPU - {0} ({1}); VMAF and non-encoding analysis use the CPU.' -f $selectedGpu.Name, $gpuEncoderName) -ForegroundColor Cyan
+}
+else {
+  Write-Host "Encoding backend: CPU - $cpuName" -ForegroundColor Cyan
+}
 
-$results = [System.Collections.Generic.List[object]]::new()
+$results = New-Object System.Collections.Generic.List[object]
 $i = 0
 foreach ($file in $files) {
   $i++
@@ -1230,7 +1579,8 @@ foreach ($file in $files) {
       New-Item -ItemType Directory -Path $work -Force | Out-Null
       try {
         $sample = Invoke-SampleAnalysis -Info $info -Codec $Codec -Crf $Crf -Preset $Preset -WorkDir $work `
-          -SampleCount $SampleCount -SampleSeconds $SampleSeconds -IncludeVmaf (-not $SkipVmaf)
+          -SampleCount $SampleCount -SampleSeconds $SampleSeconds -Gpu $selectedGpu `
+          -AvailableEncoders $caps.VideoEncoders -IncludeVmaf (-not $SkipVmaf)
         $projection = Get-Projection -Info $info -Sample $sample
       }
       finally {
@@ -1255,7 +1605,8 @@ foreach ($file in $files) {
 
     $outPath = Get-OutputPath -SourcePath $info.Path -Codec $Codec -OutputDir $OutputDir
     Write-NextSteps -Info $info -Triage $triage -Sample $sample -Projection $projection -Verdict $verdict `
-      -Codec $Codec -Crf $Crf -Preset $Preset -OutputPath $outPath -MinVmaf $MinVmaf
+      -Codec $Codec -Crf $Crf -Preset $Preset -OutputPath $outPath -MinVmaf $MinVmaf `
+      -Gpu $selectedGpu -AvailableEncoders $caps.VideoEncoders
 
     $enc = $null
     if ($Reencode) {
@@ -1266,7 +1617,8 @@ foreach ($file in $files) {
         Write-Warning "Output already exists, skipping: $outPath"
       }
       elseif ($PSCmdlet.ShouldProcess($info.Path, "Re-encode to '$outPath' ($Codec, CRF $Crf, preset $Preset)")) {
-        $enc = Invoke-Reencode -Info $info -OutputPath $outPath -Codec $Codec -Crf $Crf -Preset $Preset
+        $enc = Invoke-Reencode -Info $info -OutputPath $outPath -Codec $Codec -Crf $Crf -Preset $Preset `
+          -Gpu $selectedGpu -AvailableEncoders $caps.VideoEncoders
       }
     }
 
