@@ -15,6 +15,11 @@
     from decoder tests. Unavailable device paths are skipped with a concise
     reason; use -Verbose to see full FFmpeg diagnostics.
 
+    On Windows, the script prefers the adapter reporting the most dedicated
+    video memory and pins compatible NVIDIA, AMD, Intel, and Direct3D tests to
+    that vendor. Hardware tests that cannot be pinned unambiguously are skipped
+    rather than silently using another adapter.
+
     The verdict is based on measured sample results, not a guarantee of
     full-file performance. Hardware encoder quality modes and power use vary by
     device, so test the chosen settings on your own content before batch use.
@@ -66,6 +71,11 @@
 .EXAMPLE
     .\Test-HardwareReencodeWorth.ps1 'D:\Movies\Film.mkv' -SampleCount 3 -SampleSeconds 10 -TargetBitrateKbps 5000
     Use three 10-second samples and a fixed 5,000 kbit/s bitrate for all encoders.
+
+.EXAMPLE
+    .\Test-HardwareReencodeWorth.ps1 'D:\Movies\Film.mkv'
+    On Windows, prefer the adapter with the most dedicated memory and skip any
+    hardware backend that cannot be pinned to that adapter.
 #>
 [CmdletBinding()]
 param(
@@ -139,6 +149,11 @@ function Invoke-Native {
   )
 
   $oldPreference = $ErrorActionPreference
+  $oldCudaDeviceOrder = $env:CUDA_DEVICE_ORDER
+  if ($Script:PreferredGpu -and $Script:PreferredGpu.VendorId -eq '10de' -and
+      $null -ne $Script:PreferredGpu.NvidiaIndex) {
+    $env:CUDA_DEVICE_ORDER = 'PCI_BUS_ID'
+  }
   $ErrorActionPreference = 'Continue'
   try {
     $lines = & $FilePath @Arguments 2>&1 | ForEach-Object { "$_" }
@@ -146,6 +161,12 @@ function Invoke-Native {
   }
   finally {
     $ErrorActionPreference = $oldPreference
+    if ($null -eq $oldCudaDeviceOrder) {
+      Remove-Item Env:CUDA_DEVICE_ORDER -ErrorAction SilentlyContinue
+    }
+    else {
+      $env:CUDA_DEVICE_ORDER = $oldCudaDeviceOrder
+    }
   }
   [pscustomobject]@{ ExitCode = $exitCode; Output = ($lines -join "`n") }
 }
@@ -206,8 +227,123 @@ function Get-QualityScore {
   return $null
 }
 
+function Get-PreferredGpu {
+  if ($env:OS -ne 'Windows_NT') { return $null }
+
+  try {
+    $controllers = [System.Collections.Generic.List[object]]::new()
+    foreach ($controller in @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)) {
+      if ($controller.PNPDeviceID -match '^PCI\\VEN_([0-9A-Fa-f]{4})&') {
+        $adapterRam = [uint64]$controller.AdapterRAM
+        if ($adapterRam -gt 0) {
+          $controllers.Add([pscustomobject]@{
+            Name       = [string]$controller.Name
+            VendorId   = $Matches[1].ToLowerInvariant()
+            AdapterRam = $adapterRam
+          })
+        }
+      }
+    }
+  }
+  catch {
+    throw "Could not enumerate Windows display adapters needed for safe GPU selection: $($_.Exception.Message)"
+  }
+
+  if ($controllers.Count -eq 0) {
+    throw 'Windows did not report a PCI display adapter; refusing to run hardware tests with an unverified default GPU.'
+  }
+
+  $maximumRam = ($controllers | Measure-Object -Property AdapterRam -Maximum).Maximum
+  $topControllers = @($controllers | Where-Object { $_.AdapterRam -eq $maximumRam })
+  if ($topControllers.Count -ne 1) {
+    throw 'Windows reported multiple top-ranked GPUs with equal dedicated memory; cannot choose a preferred adapter safely.'
+  }
+
+  $gpu = $topControllers[0]
+  $vendorCount = @($controllers | Where-Object { $_.VendorId -eq $gpu.VendorId }).Count
+  if ($gpu.VendorId -notin @('10de', '1002', '8086')) {
+    throw "The preferred GPU '$($gpu.Name)' has unsupported vendor ID 0x$($gpu.VendorId); refusing to use an unselected adapter."
+  }
+
+  $nvidiaIndex = $null
+  if ($gpu.VendorId -eq '10de') {
+    $smiPath = (Get-Command 'nvidia-smi.exe' -ErrorAction SilentlyContinue).Source
+    if (-not $smiPath -and $env:ProgramFiles) {
+      $knownSmiPath = Join-Path $env:ProgramFiles 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'
+      if (Test-Path -LiteralPath $knownSmiPath -PathType Leaf) { $smiPath = $knownSmiPath }
+    }
+
+    if ($smiPath) {
+      $oldPreference = $ErrorActionPreference
+      $ErrorActionPreference = 'Continue'
+      try {
+        $smiLines = @(& $smiPath '--query-gpu=index,name,memory.total' '--format=csv,noheader,nounits' 2>&1)
+        $smiExitCode = $LASTEXITCODE
+      }
+      finally { $ErrorActionPreference = $oldPreference }
+
+      if ($smiExitCode -eq 0) {
+        $nvidiaGpus = @(
+          foreach ($line in $smiLines) {
+            if ("$line" -match '^\s*(\d+)\s*,\s*(.*?)\s*,\s*(\d+)\s*$') {
+              [pscustomobject]@{
+                Index       = [int]$Matches[1]
+                Name        = $Matches[2]
+                MemoryMiB   = [uint64]$Matches[3]
+              }
+            }
+          }
+        )
+        if ($nvidiaGpus.Count -gt 0) {
+          $nvidiaIndex = ($nvidiaGpus | Sort-Object MemoryMiB -Descending | Select-Object -First 1).Index
+        }
+      }
+    }
+    if (Test-Path Env:CUDA_VISIBLE_DEVICES) {
+      Write-Warning 'CUDA_VISIBLE_DEVICES is set; cannot safely map the selected NVIDIA adapter to FFmpeg CUDA/NVENC device indices.'
+      $nvidiaIndex = $null
+    }
+    if ($null -eq $nvidiaIndex -and $vendorCount -eq 1 -and -not (Test-Path Env:CUDA_VISIBLE_DEVICES)) {
+      $nvidiaIndex = 0
+    }
+  }
+
+  [pscustomobject]@{
+    Name           = $gpu.Name
+    VendorId       = $gpu.VendorId
+    AdapterRam     = $gpu.AdapterRam
+    VendorCount    = $vendorCount
+    NvidiaIndex    = $nvidiaIndex
+  }
+}
+
 function Get-EncoderSetup {
   param([Parameter(Mandatory)][string]$Encoder)
+
+  $encoderVendorId = switch -Regex ($Encoder) {
+    '(?i)_nvenc$' { '10de'; break }
+    '(?i)_amf$' { '1002'; break }
+    '(?i)_qsv$' { '8086'; break }
+    default { $null }
+  }
+  if ($Script:PreferredGpu -and $encoderVendorId -and
+      $encoderVendorId -ne $Script:PreferredGpu.VendorId) {
+    return [pscustomobject]@{
+      SkipReason = "Windows prefers '$($Script:PreferredGpu.Name)'; $Encoder targets a different GPU vendor."
+    }
+  }
+  if ($Script:PreferredGpu -and $Encoder -ne 'libx264' -and -not $encoderVendorId) {
+    return [pscustomobject]@{
+      SkipReason = "FFmpeg does not expose a reliable selector for the preferred GPU '$($Script:PreferredGpu.Name)' with $Encoder."
+    }
+  }
+  if ($Script:PreferredGpu -and $encoderVendorId -and
+      $Script:PreferredGpu.VendorId -eq $encoderVendorId -and
+      $Script:PreferredGpu.VendorCount -gt 1 -and $encoderVendorId -ne '10de') {
+    return [pscustomobject]@{
+      SkipReason = "Multiple GPUs from this vendor are present, and FFmpeg cannot unambiguously select '$($Script:PreferredGpu.Name)' for $Encoder."
+    }
+  }
 
   switch -Regex ($Encoder) {
     '_(d3d12va|vaapi|vulkan)$' {
@@ -223,15 +359,60 @@ function Get-EncoderSetup {
         DeviceArgs  = @('-init_hw_device', "$deviceType=$deviceName", '-filter_hw_device', $deviceName)
         VideoFilter = 'format=nv12,hwupload'
         PixelFormat = $null
+        EncoderArgs = @()
         SkipReason  = $null
       }
     }
     '_qsv$' {
       $deviceName = 'bench'
+      $deviceArgs = if ($env:OS -eq 'Windows_NT' -and $Script:PreferredGpu -and
+          $Script:PreferredGpu.VendorId -eq '8086') {
+        @(
+          '-init_hw_device', "d3d11va=preferred:,vendor_id=0x$($Script:PreferredGpu.VendorId)",
+          '-init_hw_device', "qsv=$deviceName@preferred", '-filter_hw_device', $deviceName
+        )
+      }
+      else {
+        @('-init_hw_device', "qsv=$deviceName", '-filter_hw_device', $deviceName)
+      }
       return [pscustomobject]@{
-        DeviceArgs  = @('-init_hw_device', "qsv=$deviceName", '-filter_hw_device', $deviceName)
+        DeviceArgs  = $deviceArgs
         VideoFilter = 'format=nv12,hwupload=extra_hw_frames=64'
         PixelFormat = $null
+        EncoderArgs = @()
+        SkipReason  = $null
+      }
+    }
+    '(?i)_amf$' {
+      $deviceName = 'bench'
+      $deviceArgs = if ($env:OS -eq 'Windows_NT' -and $Script:PreferredGpu -and
+          $Script:PreferredGpu.VendorId -eq '1002') {
+        @(
+          '-init_hw_device', "d3d11va=preferred:,vendor_id=0x$($Script:PreferredGpu.VendorId)",
+          '-init_hw_device', "amf=$deviceName@preferred", '-filter_hw_device', $deviceName
+        )
+      }
+      else { @() }
+      $videoFilter = if ($deviceArgs.Count -gt 0) { 'format=nv12,hwupload' } else { $null }
+      return [pscustomobject]@{
+        DeviceArgs  = $deviceArgs
+        VideoFilter = $videoFilter
+        PixelFormat = $(if ($videoFilter) { $null } else { 'yuv420p' })
+        EncoderArgs = @()
+        SkipReason  = $null
+      }
+    }
+    '(?i)_nvenc$' {
+      if ($Script:PreferredGpu -and $null -eq $Script:PreferredGpu.NvidiaIndex) {
+        return [pscustomobject]@{
+          SkipReason = "Could not determine the NVIDIA adapter index for '$($Script:PreferredGpu.Name)'."
+        }
+      }
+      return [pscustomobject]@{
+        DeviceArgs  = @()
+        VideoFilter = $null
+        PixelFormat = 'yuv420p'
+        EncoderArgs = $(if ($Script:PreferredGpu) { @('-gpu', [string]$Script:PreferredGpu.NvidiaIndex) } else { @() })
         SkipReason  = $null
       }
     }
@@ -240,6 +421,7 @@ function Get-EncoderSetup {
         DeviceArgs  = @()
         VideoFilter = $null
         PixelFormat = 'yuv420p'
+        EncoderArgs = @()
         SkipReason  = $null
       }
     }
@@ -289,6 +471,7 @@ function Measure-Encoder {
     $encodeArgs += @(
       '-c:v', $Encoder, '-b:v', $rate, '-maxrate', $rate, '-bufsize', "$($BitrateKbps * 2)k"
     )
+    if ($setup.EncoderArgs) { $encodeArgs += $setup.EncoderArgs }
     if ($setup.PixelFormat) { $encodeArgs += @('-pix_fmt', $setup.PixelFormat) }
     $encodeArgs += $outputPath
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
@@ -342,13 +525,64 @@ function Measure-DecodeSpeed {
     return $null
   }
 
+  $decodeDeviceArgs = @()
+  $hardwareAccelerationArgs = @()
+  if ($HardwareAcceleration -and $env:OS -eq 'Windows_NT' -and $Script:PreferredGpu) {
+    $vendorId = $Script:PreferredGpu.VendorId
+    switch ($HardwareAcceleration) {
+      'cuda' {
+        if ($vendorId -ne '10de' -or $null -eq $Script:PreferredGpu.NvidiaIndex) {
+          Write-Warning "Skipping CUDA decode: it cannot be pinned to the preferred GPU '$($Script:PreferredGpu.Name)'."
+          return $null
+        }
+        $hardwareAccelerationArgs = @('-hwaccel', 'cuda', '-hwaccel_device', [string]$Script:PreferredGpu.NvidiaIndex)
+      }
+      'd3d11va' {
+        if ($Script:PreferredGpu.VendorCount -gt 1) {
+          Write-Warning "Skipping D3D11VA decode: multiple GPUs share vendor 0x$vendorId, so '$($Script:PreferredGpu.Name)' cannot be selected unambiguously."
+          return $null
+        }
+        $decodeDeviceArgs = @('-init_hw_device', "d3d11va=preferred:,vendor_id=0x$vendorId")
+        $hardwareAccelerationArgs = @('-hwaccel', 'd3d11va', '-hwaccel_device', 'preferred')
+      }
+      'amf' {
+        if ($vendorId -ne '1002' -or $Script:PreferredGpu.VendorCount -gt 1) {
+          Write-Warning "Skipping AMF decode: it cannot be pinned unambiguously to the preferred GPU '$($Script:PreferredGpu.Name)'."
+          return $null
+        }
+        $decodeDeviceArgs = @(
+          '-init_hw_device', "d3d11va=preferred:,vendor_id=0x$vendorId",
+          '-init_hw_device', 'amf=decode@preferred'
+        )
+        $hardwareAccelerationArgs = @('-hwaccel', 'amf', '-hwaccel_device', 'decode')
+      }
+      'qsv' {
+        if ($vendorId -ne '8086' -or $Script:PreferredGpu.VendorCount -gt 1) {
+          Write-Warning "Skipping QSV decode: it cannot be pinned unambiguously to the preferred GPU '$($Script:PreferredGpu.Name)'."
+          return $null
+        }
+        $decodeDeviceArgs = @(
+          '-init_hw_device', "d3d11va=preferred:,vendor_id=0x$vendorId",
+          '-init_hw_device', 'qsv=decode@preferred'
+        )
+        $hardwareAccelerationArgs = @('-hwaccel', 'qsv', '-hwaccel_device', 'decode')
+      }
+      default {
+        Write-Warning "Skipping $HardwareAcceleration decode: this script cannot reliably pin that backend to the preferred GPU '$($Script:PreferredGpu.Name)'."
+        return $null
+      }
+    }
+  }
+
   $duration = 0.0
   $seconds = 0.0
   foreach ($clip in $Plan) {
     $startText = $clip.Start.ToString('0.###', [System.Globalization.CultureInfo]::InvariantCulture)
     $lengthText = $clip.Length.ToString('0.###', [System.Globalization.CultureInfo]::InvariantCulture)
-    $decodeArgs = @('-hide_banner', '-v', 'error', '-nostdin')
-    if ($HardwareAcceleration) { $decodeArgs += @('-hwaccel', $HardwareAcceleration) }
+    $decodeArgs = @('-hide_banner', '-v', 'error', '-nostdin') + $decodeDeviceArgs + $hardwareAccelerationArgs
+    if ($HardwareAcceleration -and -not $hardwareAccelerationArgs) {
+      $decodeArgs += @('-hwaccel', $HardwareAcceleration)
+    }
     $decodeArgs += @(
       '-ss', $startText, '-t', $lengthText, '-i', $InputPath,
       '-map', ('0:{0}' -f $VideoIndex), '-an', '-f', 'null', '-'
@@ -380,6 +614,12 @@ if (-not $Script:FfprobeExe) {
   if (Test-Path -LiteralPath $siblingProbe -PathType Leaf) { $Script:FfprobeExe = $siblingProbe }
 }
 if (-not $Script:FfprobeExe) { throw 'ffprobe.exe was not found. Put it on PATH or specify -FfprobePath.' }
+$Script:PreferredGpu = Get-PreferredGpu
+if ($Script:PreferredGpu) {
+  $reportedMemoryGiB = $Script:PreferredGpu.AdapterRam / 1GB
+  Write-Host ('Preferred Windows GPU: {0} (vendor 0x{1}, {2:N2} GiB reported dedicated memory).' -f
+    $Script:PreferredGpu.Name, $Script:PreferredGpu.VendorId, $reportedMemoryGiB)
+}
 
 $inputPath = (Resolve-Path -LiteralPath $Path).Path
 $probe = Invoke-Native -FilePath $Script:FfprobeExe -Arguments @(
@@ -439,6 +679,14 @@ $decodeAccels = @(
   $hardwareAccels |
     Where-Object { $_ -ne 'opencl' -and -not ($_ -eq 'vaapi' -and $env:OS -eq 'Windows_NT') }
 )
+if ($Script:PreferredGpu) {
+  $preferredAccels = switch ($Script:PreferredGpu.VendorId) {
+    '10de' { @('cuda', 'd3d11va') }
+    '1002' { @('amf', 'd3d11va') }
+    '8086' { @('qsv', 'd3d11va') }
+  }
+  $decodeAccels = @($decodeAccels | Where-Object { $_ -in $preferredAccels })
+}
 Write-Host ('Hardware acceleration APIs listed by FFmpeg: {0}' -f $(if ($hardwareAccels.Count) { $hardwareAccels -join ', ' } else { 'none' }))
 Write-Host ('Decode backends to test: {0}' -f $(if ($decodeAccels.Count) { $decodeAccels -join ', ' } else { 'none' }))
 if ($hardwareAccels -contains 'opencl') {
