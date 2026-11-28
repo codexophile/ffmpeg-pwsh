@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     Decides whether re-encoding a video file (or folder of videos) to HEVC or AV1 is worth the time and quality cost.
@@ -19,9 +19,7 @@
 
     Requirements (all free):  winget install Gyan.FFmpeg   (the "full" build includes libx265, libsvtav1, libvmaf)
     Optional: HandBrakeCLI (only used to print equivalent arguments).
-
-    This file must stay ASCII / UTF-8 with BOM if you edit it in an editor that changes encodings, because
-    Windows PowerShell 5.1 misreads BOM-less UTF-8 containing non-ASCII characters.
+    Requires PowerShell 7.0 or later.
 
 .PARAMETER Path
     One or more video files, folders, or wildcard patterns. Folders are scanned for common video extensions.
@@ -409,7 +407,7 @@ function Get-VideoFiles {
     [Parameter(Mandatory, Position = 0)][string[]]$Paths,
     [Parameter(Position = 1)][switch]$Recurse
   )
-  $found = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+  $found = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
   foreach ($p in $Paths) {
     $items = @()
     if (Test-Path -LiteralPath $p) { $items = @(Get-Item -LiteralPath $p) }
@@ -541,7 +539,7 @@ function Get-TriageAssessment {
     [Parameter(Mandatory, Position = 0)][pscustomobject]$Info,
     [Parameter(Mandatory, Position = 1)][ValidateSet('x265', 'av1')][string]$Codec
   )
-  $notes = New-Object System.Collections.Generic.List[string]
+  $notes = [System.Collections.Generic.List[string]]::new()
   $pixels = [double]$Info.Width * $Info.Height
   $bpp = 0.0
   if ($pixels -gt 0 -and $Info.Fps -gt 0) { $bpp = $Info.VideoBitrate / ($pixels * $Info.Fps) }
@@ -795,7 +793,7 @@ function Invoke-SampleAnalysis {
   $plan = @(Get-SamplePlan -Duration $Info.Duration -Count $SampleCount -Seconds $SampleSeconds)
   $encArgs = @(Get-VideoEncoderArguments -Codec $Codec -Crf $Crf -Preset $Preset -QuietEncoder)
   $srcBytes = 0L; $encBytes = 0L; $srcSeconds = 0.0; $wall = 0.0
-  $scores = New-Object System.Collections.Generic.List[double]
+  $scores = [System.Collections.Generic.List[double]]::new()
   $done = 0
 
   Write-Host ('[2] Sample encode: {0} clip(s) x {1}s, {2} CRF {3} preset {4}' -f $plan.Count, $SampleSeconds, $Codec, $Crf, $Preset) -ForegroundColor Cyan
@@ -917,7 +915,7 @@ function Get-Verdict {
     [Parameter(Mandatory)][double]$MinVmaf,
     [Parameter(Mandatory)][int]$MinSavedMB
   )
-  $reasons = New-Object System.Collections.Generic.List[string]
+  $reasons = [System.Collections.Generic.List[string]]::new()
   $fail = $false; $marginal = $false
 
   if ($null -eq $Sample -or $null -eq $Projection) {
@@ -1157,10 +1155,15 @@ function Invoke-Reencode {
   $ffArgs = @('-loglevel', 'warning', '-stats') + $ffArgs
   Write-Host "[5] Re-encoding to $OutputPath" -ForegroundColor Cyan
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  $ErrorActionPreference = 'Continue'
-  & $Script:FfmpegExe @ffArgs
-  $code = $LASTEXITCODE
-  $ErrorActionPreference = 'Stop'
+  $oldPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue'
+    & $Script:FfmpegExe @ffArgs
+    $code = $LASTEXITCODE
+  }
+  finally {
+    $ErrorActionPreference = $oldPreference
+  }
   $sw.Stop()
   Write-Host ''
   if ($code -ne 0 -or -not (Test-Path -LiteralPath $OutputPath)) {
@@ -1210,7 +1213,7 @@ $files = @(Get-VideoFiles -Paths $Path -Recurse:$Recurse)
 if ($files.Count -eq 0) { throw 'No video files found.' }
 Write-Host ('Analyzing {0} file(s): {1} CRF {2} preset {3}{4}' -f $files.Count, $Codec, $Crf, $Preset, $(if ($SkipSample) { ' (triage only)' } else { '' })) -ForegroundColor White
 
-$results = New-Object System.Collections.Generic.List[object]
+$results = [System.Collections.Generic.List[object]]::new()
 $i = 0
 foreach ($file in $files) {
   $i++

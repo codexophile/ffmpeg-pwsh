@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     Compares CPU and hardware H.264 encoding and video decoding on short samples.
@@ -18,6 +18,7 @@
     The verdict is based on measured sample results, not a guarantee of
     full-file performance. Hardware encoder quality modes and power use vary by
     device, so test the chosen settings on your own content before batch use.
+    Requires PowerShell 7.0 or later.
 
 .PARAMETER Path
     Input video file.
@@ -125,7 +126,7 @@ function Resolve-Executable {
   $finder = Join-Path $PSScriptRoot 'ffmpeg-find.ps1'
   if (Test-Path -LiteralPath $finder -PathType Leaf) {
     $found = @(& $finder -Executable $Name -ErrorAction SilentlyContinue 2>$null |
-      Where-Object { $_ -is [string] -and (Test-Path -LiteralPath $_ -PathType Leaf) })
+        Where-Object { $_ -is [string] -and (Test-Path -LiteralPath $_ -PathType Leaf) })
     if ($found.Count -gt 0) { return [string]$found[0] }
   }
   return $null
@@ -219,27 +220,27 @@ function Get-EncoderSetup {
 
       $deviceName = 'bench'
       return [pscustomobject]@{
-        DeviceArgs = @('-init_hw_device', "$deviceType=$deviceName", '-filter_hw_device', $deviceName)
+        DeviceArgs  = @('-init_hw_device', "$deviceType=$deviceName", '-filter_hw_device', $deviceName)
         VideoFilter = 'format=nv12,hwupload'
         PixelFormat = $null
-        SkipReason = $null
+        SkipReason  = $null
       }
     }
     '_qsv$' {
       $deviceName = 'bench'
       return [pscustomobject]@{
-        DeviceArgs = @('-init_hw_device', "qsv=$deviceName", '-filter_hw_device', $deviceName)
+        DeviceArgs  = @('-init_hw_device', "qsv=$deviceName", '-filter_hw_device', $deviceName)
         VideoFilter = 'format=nv12,hwupload=extra_hw_frames=64'
         PixelFormat = $null
-        SkipReason = $null
+        SkipReason  = $null
       }
     }
     default {
       return [pscustomobject]@{
-        DeviceArgs = @()
+        DeviceArgs  = @()
         VideoFilter = $null
         PixelFormat = 'yuv420p'
-        SkipReason = $null
+        SkipReason  = $null
       }
     }
   }
@@ -250,8 +251,8 @@ function Get-FailureSummary {
 
   $relevant = @(
     $Output -split '\r?\n' |
-    Where-Object { $_ -match '(?i)(error|failed|failure|unable|no device|not supported|unsupported|impossible|not implemented|could not|cannot)' } |
-    Select-Object -Last 4
+      Where-Object { $_ -match '(?i)(error|failed|failure|unable|no device|not supported|unsupported|impossible|not implemented|could not|cannot)' } |
+        Select-Object -Last 4
   )
   if ($relevant.Count -eq 0) {
     $relevant = @($Output -split '\r?\n' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 3)
@@ -271,7 +272,7 @@ function Measure-Encoder {
 
   $totalBytes = 0L
   $totalSeconds = 0.0
-  $qualityScores = New-Object System.Collections.Generic.List[double]
+  $qualityScores = [System.Collections.Generic.List[double]]::new()
   $sampleDuration = 0.0
   $setup = Get-EncoderSetup -Encoder $Encoder
   if ($setup.SkipReason) {
@@ -280,10 +281,10 @@ function Measure-Encoder {
   }
 
   for ($i = 0; $i -lt $Samples.Count; $i++) {
-    $outputPath = Join-Path $WorkDir ("{0}_{1}.mkv" -f $Name, $i)
+    $outputPath = Join-Path $WorkDir ('{0}_{1}.mkv' -f $Name, $i)
     $rate = "$($BitrateKbps)k"
     $encodeArgs = @('-hide_banner', '-v', 'error', '-nostdin', '-y') + $setup.DeviceArgs +
-      @('-i', $Samples[$i], '-map', '0:v:0', '-an', '-sn', '-dn')
+    @('-i', $Samples[$i], '-map', '0:v:0', '-an', '-sn', '-dn')
     if ($setup.VideoFilter) { $encodeArgs += @('-vf', $setup.VideoFilter) }
     $encodeArgs += @(
       '-c:v', $Encoder, '-b:v', $rate, '-maxrate', $rate, '-bufsize', "$($BitrateKbps * 2)k"
@@ -312,7 +313,7 @@ function Measure-Encoder {
     }
 
     $quality = Get-QualityScore -EncodedPath $outputPath -ReferencePath $Samples[$i] `
-      -Metric $Metric -WorkDir $WorkDir -Index ("{0}_{1}" -f $Name, $i)
+      -Metric $Metric -WorkDir $WorkDir -Index ('{0}_{1}' -f $Name, $i)
     if ($null -ne $quality) { $qualityScores.Add([double]$quality) }
   }
 
@@ -390,8 +391,8 @@ if ($probe.ExitCode -ne 0) { throw "ffprobe could not read '$inputPath': $($prob
 $media = $probe.Output | ConvertFrom-Json
 $videoStream = @(
   $media.streams |
-  Where-Object { $_.codec_type -eq 'video' -and -not ($_.disposition -and $_.disposition.attached_pic -eq 1) } |
-  Select-Object -First 1
+    Where-Object { $_.codec_type -eq 'video' -and -not ($_.disposition -and $_.disposition.attached_pic -eq 1) } |
+      Select-Object -First 1
 )
 if ($videoStream.Count -eq 0) { throw "No video stream found in '$inputPath'." }
 $duration = 0.0
@@ -415,9 +416,9 @@ $encoderRun = Invoke-Native -FilePath $Script:FfmpegExe -Arguments @('-hide_bann
 if ($encoderRun.ExitCode -ne 0) { throw "Could not query FFmpeg encoders: $($encoderRun.Output)" }
 $allHardwareEncoders = @(
   [regex]::Matches($encoderRun.Output, '^\s*V\S*\s+(\S+)', [System.Text.RegularExpressions.RegexOptions]::Multiline) |
-  ForEach-Object { $_.Groups[1].Value } |
-  Where-Object { $_ -match '(?i)(nvenc|qsv|amf|vaapi|videotoolbox|v4l2m2m|mediacodec|omx|vulkan|d3d12va|_mf$)' } |
-  Sort-Object -Unique
+    ForEach-Object { $_.Groups[1].Value } |
+      Where-Object { $_ -match '(?i)(nvenc|qsv|amf|vaapi|videotoolbox|v4l2m2m|mediacodec|omx|vulkan|d3d12va|_mf$)' } |
+        Sort-Object -Unique
 )
 $h264HardwareEncoders = @($allHardwareEncoders | Where-Object { $_ -match '^h264_' })
 if ($allHardwareEncoders.Count -gt 0) {
@@ -431,12 +432,12 @@ $accelRun = Invoke-Native -FilePath $Script:FfmpegExe -Arguments @('-hide_banner
 if ($accelRun.ExitCode -ne 0) { throw "Could not query FFmpeg hardware accelerators: $($accelRun.Output)" }
 $hardwareAccels = @(
   [regex]::Matches($accelRun.Output, '^\s*([a-z0-9_]+)\s*$', [System.Text.RegularExpressions.RegexOptions]::Multiline) |
-  ForEach-Object { $_.Groups[1].Value } |
-  Sort-Object -Unique
+    ForEach-Object { $_.Groups[1].Value } |
+      Sort-Object -Unique
 )
 $decodeAccels = @(
   $hardwareAccels |
-  Where-Object { $_ -ne 'opencl' -and -not ($_ -eq 'vaapi' -and $env:OS -eq 'Windows_NT') }
+    Where-Object { $_ -ne 'opencl' -and -not ($_ -eq 'vaapi' -and $env:OS -eq 'Windows_NT') }
 )
 Write-Host ('Hardware acceleration APIs listed by FFmpeg: {0}' -f $(if ($hardwareAccels.Count) { $hardwareAccels -join ', ' } else { 'none' }))
 Write-Host ('Decode backends to test: {0}' -f $(if ($decodeAccels.Count) { $decodeAccels -join ', ' } else { 'none' }))
@@ -461,9 +462,9 @@ New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 
 try {
   $plan = @(Get-SamplePlan -Duration $duration -Count $SampleCount -Seconds $SampleSeconds)
-  $samples = New-Object System.Collections.Generic.List[string]
+  $samples = [System.Collections.Generic.List[string]]::new()
   for ($i = 0; $i -lt $plan.Count; $i++) {
-    $samplePath = Join-Path $workDir ("reference_{0}.mkv" -f $i)
+    $samplePath = Join-Path $workDir ('reference_{0}.mkv' -f $i)
     $startText = $plan[$i].Start.ToString('0.###', [System.Globalization.CultureInfo]::InvariantCulture)
     $lengthText = $plan[$i].Length.ToString('0.###', [System.Globalization.CultureInfo]::InvariantCulture)
     $extract = Invoke-Native -FilePath $Script:FfmpegExe -Arguments @(
@@ -484,7 +485,7 @@ try {
   $cpuResult = Measure-Encoder -Name 'cpu' -Encoder 'libx264' -Samples $samples.ToArray() `
     -BitrateKbps $TargetBitrateKbps -WorkDir $workDir -Metric $qualityMetric
   if (-not $cpuResult) { throw 'The CPU libx264 baseline encode failed; no GPU comparison can be made.' }
-  $encodeResults = New-Object System.Collections.Generic.List[object]
+  $encodeResults = [System.Collections.Generic.List[object]]::new()
   $encodeResults.Add($cpuResult)
 
   foreach ($encoder in $h264HardwareEncoders) {
@@ -498,13 +499,13 @@ try {
   Write-Host '=== Encoding comparison (speed is sample seconds per wall-clock second)' -ForegroundColor Cyan
   $encodeResults |
     Select-Object Name, Encoder,
-      @{n = 'SizeMB'; e = { [Math]::Round($_.Bytes / 1MB, 2) }},
-      @{n = 'EncodeSeconds'; e = { [Math]::Round($_.Seconds, 2) }},
-      @{n = 'RealtimeSpeed'; e = { [Math]::Round($_.Speed, 2) }},
-      @{n = $qualityMetric; e = { if ($null -ne $_.Quality) { [Math]::Round($_.Quality, 3) } else { 'n/a' } }} |
-    Format-Table -AutoSize | Out-Host
+    @{n = 'SizeMB'; e = { [Math]::Round($_.Bytes / 1MB, 2) } },
+    @{n = 'EncodeSeconds'; e = { [Math]::Round($_.Seconds, 2) } },
+    @{n = 'RealtimeSpeed'; e = { [Math]::Round($_.Speed, 2) } },
+    @{n = $qualityMetric; e = { if ($null -ne $_.Quality) { [Math]::Round($_.Quality, 3) } else { 'n/a' } } } |
+      Format-Table -AutoSize | Out-Host
 
-  if ($cpuResult.Quality -eq $null) {
+  if ($null -eq $cpuResult.Quality) {
     Write-Warning 'Quality scores could not be measured; encoding verdicts are inconclusive.'
   }
   else {
@@ -538,7 +539,7 @@ try {
 
   Write-Host ''
   Write-Host '=== Decode comparison' -ForegroundColor Cyan
-  $decodeResults = New-Object System.Collections.Generic.List[object]
+  $decodeResults = [System.Collections.Generic.List[object]]::new()
   $cpuDecode = Measure-DecodeSpeed -Label 'CPU' -InputPath $inputPath -VideoIndex $videoStream[0].index -Plan $plan
   if ($cpuDecode) { $decodeResults.Add($cpuDecode) }
   else { Write-Warning 'CPU decode baseline failed; GPU decode speedups cannot be evaluated.' }
@@ -549,10 +550,10 @@ try {
   }
   $decodeResults |
     Select-Object Accelerator,
-      @{n = 'DecodeSeconds'; e = { [Math]::Round($_.Seconds, 2) }},
-      @{n = 'RealtimeSpeed'; e = { [Math]::Round($_.Speed, 2) }},
-      @{n = 'SpeedupVsCPU'; e = { if ($cpuDecode) { [Math]::Round($_.Speed / [Math]::Max(0.001, $cpuDecode.Speed), 2) } else { $null } }} |
-    Format-Table -AutoSize | Out-Host
+    @{n = 'DecodeSeconds'; e = { [Math]::Round($_.Seconds, 2) } },
+    @{n = 'RealtimeSpeed'; e = { [Math]::Round($_.Speed, 2) } },
+    @{n = 'SpeedupVsCPU'; e = { if ($cpuDecode) { [Math]::Round($_.Speed / [Math]::Max(0.001, $cpuDecode.Speed), 2) } else { $null } } } |
+      Format-Table -AutoSize | Out-Host
 
   if ($cpuDecode) {
     foreach ($result in @($decodeResults | Where-Object { $_.Accelerator -ne 'CPU' })) {
