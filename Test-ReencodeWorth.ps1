@@ -53,6 +53,10 @@
 .PARAMETER Preset
     Encoder preset. x265: ultrafast..placebo (default 'slow'). av1: 0-13 (default 5).
 
+.PARAMETER MaxHeight
+    Optional maximum output height in pixels (for example 1080 or 720). Videos already at or below
+    this height are not upscaled. Sample-based size and encode-time estimates include the downscale.
+
 .PARAMETER SampleCount
     Number of clips to sample, spread evenly across the file. Default 5.
 
@@ -76,7 +80,8 @@
     With -Reencode, also re-encode files whose verdict is NOT WORTH IT.
 
 .PARAMETER OutputDir
-    Folder for re-encoded files. Defaults to the source file's folder. Output is <name>.<codec>.mkv.
+    Folder for re-encoded files. Defaults to the source file's folder. Output is <name>.<codec>.mkv,
+    or <name>.<codec>-<MaxHeight>p.mkv when -MaxHeight is set.
 
 .PARAMETER TempDir
     Folder for temporary sample clips. Defaults to the system temp folder.
@@ -107,6 +112,14 @@
 .EXAMPLE
     .\Test-ReencodeWorth.ps1 'D:\Movies\Film.mkv' -Codec av1 -Reencode
     Analyze with SVT-AV1, then prompt before encoding.
+
+.EXAMPLE
+    .\Test-ReencodeWorth.ps1 'D:\Movies\Film.mkv' -MaxHeight 1080 -Reencode
+    Estimate and re-encode at up to 1080p, preserving the source aspect ratio.
+
+.EXAMPLE
+    .\Test-ReencodeWorth.ps1 'D:\Movies' -Recurse -MaxHeight 720 -SkipSample
+    Triage a library for 720p output (size savings are not projected when samples are skipped).
 
 .EXAMPLE
     .\Test-ReencodeWorth.ps1 'D:\Movies\Film.mkv' -UseGpu -Reencode
@@ -143,6 +156,10 @@ param(
   [int]$Crf,
 
   [string]$Preset,
+
+  [ValidateRange(2, 16384)]
+  [ValidateScript({ $_ % 2 -eq 0 })]
+  [int]$MaxHeight,
 
   [ValidateRange(1, 20)]
   [int]$SampleCount = 5,
@@ -257,6 +274,19 @@ function ConvertTo-FrameRate {
   $den = ConvertTo-NullableDouble $parts[1]
   if ($null -eq $den -or $den -eq 0) { return 0.0 }
   return [double]($num / $den)
+}
+
+function Get-ScaleFilter {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory)][int]$SourceHeight,
+    [Parameter(Mandatory)][int]$MaxHeight
+  )
+  if ($MaxHeight -gt 0 -and $SourceHeight -gt $MaxHeight) {
+    return "scale=-2:trunc(min(ih\,${MaxHeight})/2)*2:flags=lanczos"
+  }
+  return $null
 }
 
 function Format-FileSize {
@@ -798,7 +828,8 @@ function Get-TriageAssessment {
   [OutputType([pscustomobject])]
   param(
     [Parameter(Mandatory, Position = 0)][pscustomobject]$Info,
-    [Parameter(Mandatory, Position = 1)][ValidateSet('x265', 'av1')][string]$Codec
+    [Parameter(Mandatory, Position = 1)][ValidateSet('x265', 'av1')][string]$Codec,
+    [int]$MaxHeight = 0
   )
   $notes = New-Object System.Collections.Generic.List[string]
   $pixels = [double]$Info.Width * $Info.Height
@@ -830,6 +861,9 @@ function Get-TriageAssessment {
   }
 
   if ($Info.BitrateSource -eq 'estimated') { $notes.Add('Video bitrate was estimated from file size (stream did not report it).') }
+  if ($MaxHeight -gt 0 -and $Info.Height -gt $MaxHeight) {
+    $notes.Add("Output will be downscaled to a maximum height of ${MaxHeight}px; sample-based size and encode-time estimates include this.")
+  }
   if ($Info.IsHdr) { $notes.Add('HDR source: check HDR metadata after encoding; Dolby Vision layers are dropped; VMAF is less reliable on HDR.') }
   if ($Info.FieldOrder -in @('tt', 'bb', 'tb', 'bt')) { $notes.Add('Interlaced source: consider deinterlacing (e.g. -vf bwdif) before encoding.') }
   if ($Info.SubtitleCodecs -contains 'mov_text') { $notes.Add('mov_text subtitles cannot be copied into MKV; they will be converted to SRT.') }
@@ -907,18 +941,26 @@ function Get-VideoEncoderArguments {
     [Parameter(Mandatory)][string]$Preset,
     [AllowNull()][pscustomobject]$Gpu,
     [string[]]$AvailableEncoders = @(),
-    [switch]$QuietEncoder
+    [switch]$QuietEncoder,
+    [string]$ScaleFilter
   )
   if ($Gpu) {
-    return @(Get-GpuVideoEncoderArguments -Gpu $Gpu -Codec $Codec -Crf $Crf `
+    $a = @(Get-GpuVideoEncoderArguments -Gpu $Gpu -Codec $Codec -Crf $Crf `
         -Preset $Preset -AvailableEncoders $AvailableEncoders)
   }
-  if ($Codec -eq 'x265') {
-    $a = @('-c:v', 'libx265', '-preset', $Preset, '-crf', "$Crf", '-pix_fmt', 'yuv420p10le')
-    if ($QuietEncoder) { $a += @('-x265-params', 'log-level=error') }
-  }
   else {
-    $a = @('-c:v', 'libsvtav1', '-preset', $Preset, '-crf', "$Crf", '-pix_fmt', 'yuv420p10le')
+    if ($Codec -eq 'x265') {
+      $a = @('-c:v', 'libx265', '-preset', $Preset, '-crf', "$Crf", '-pix_fmt', 'yuv420p10le')
+      if ($QuietEncoder) { $a += @('-x265-params', 'log-level=error') }
+    }
+    else {
+      $a = @('-c:v', 'libsvtav1', '-preset', $Preset, '-crf', "$Crf", '-pix_fmt', 'yuv420p10le')
+    }
+  }
+  if ($ScaleFilter) {
+    $vfIndex = [array]::IndexOf($a, '-vf')
+    if ($vfIndex -ge 0) { $a[$vfIndex + 1] = "$ScaleFilter,$($a[$vfIndex + 1])" }
+    else { $a += @('-vf', $ScaleFilter) }
   }
   return $a
 }
@@ -951,7 +993,8 @@ function Measure-Vmaf {
     .SYNOPSIS
         Computes per-frame VMAF scores of an encoded clip against its reference clip.
     .DESCRIPTION
-        Both inputs are converted to yuv420p10le so libvmaf's matching-format requirement is satisfied.
+        When the sample was downscaled, the encoded clip is upscaled to the source dimensions before
+        comparison so VMAF includes the resolution loss. Both inputs are converted to yuv420p10le.
         The log is written to a relative path inside WorkDir to avoid Windows drive-letter escaping in filters.
     .PARAMETER Distorted
         Encoded clip (first input).
@@ -967,13 +1010,19 @@ function Measure-Vmaf {
   param(
     [Parameter(Mandatory)][string]$Distorted,
     [Parameter(Mandatory)][string]$Reference,
-    [Parameter(Mandatory)][string]$WorkDir
+    [Parameter(Mandatory)][string]$WorkDir,
+    [Parameter(Mandatory)][pscustomobject]$Info,
+    [int]$MaxHeight = 0
   )
   $logName = 'vmaf.json'
   $logPath = Join-Path $WorkDir $logName
   if (Test-Path -LiteralPath $logPath) { Remove-Item -LiteralPath $logPath -Force }
   $threads = [Environment]::ProcessorCount
-  $filter = '[0:v]format=yuv420p10le,setpts=PTS-STARTPTS[d];[1:v]format=yuv420p10le,setpts=PTS-STARTPTS[r];' +
+  $scale = if ($MaxHeight -gt 0 -and $Info.Height -gt $MaxHeight) {
+    "scale=$($Info.Width):$($Info.Height):flags=bicubic,"
+  }
+  else { '' }
+  $filter = "[0:v]${scale}format=yuv420p10le,setpts=PTS-STARTPTS[d];[1:v]format=yuv420p10le,setpts=PTS-STARTPTS[r];" +
   "[d][r]libvmaf=log_fmt=json:log_path=${logName}:n_threads=$threads"
   Push-Location -LiteralPath $WorkDir
   try {
@@ -996,7 +1045,8 @@ function Invoke-SampleAnalysis {
         Cuts, encodes and (optionally) VMAF-scores short clips, returning aggregate numbers.
     .DESCRIPTION
         Each clip is first stream-copied out of the source (video only) so size comparison is fair
-        (same frames in and out), then encoded with the intended settings and timed.
+        (same frames in and out), then encoded with the intended settings and timed. The optional
+        maximum output height is applied to sample encodes, so projected size and speed include scaling.
     .PARAMETER Info
         Object returned by Get-MediaInfo.
     .PARAMETER Codec
@@ -1033,11 +1083,13 @@ function Invoke-SampleAnalysis {
     [Parameter(Mandatory)][int]$SampleSeconds,
     [AllowNull()][pscustomobject]$Gpu,
     [string[]]$AvailableEncoders = @(),
-    [bool]$IncludeVmaf = $true
+    [bool]$IncludeVmaf = $true,
+    [int]$MaxHeight = 0
   )
   $plan = @(Get-SamplePlan -Duration $Info.Duration -Count $SampleCount -Seconds $SampleSeconds)
+  $scaleFilter = Get-ScaleFilter -SourceHeight $Info.Height -MaxHeight $MaxHeight
   $encArgs = @(Get-VideoEncoderArguments -Codec $Codec -Crf $Crf -Preset $Preset -Gpu $Gpu `
-      -AvailableEncoders $AvailableEncoders -QuietEncoder)
+      -AvailableEncoders $AvailableEncoders -QuietEncoder -ScaleFilter $scaleFilter)
   $srcBytes = 0L; $encBytes = 0L; $srcSeconds = 0.0; $wall = 0.0
   $scores = New-Object System.Collections.Generic.List[double]
   $done = 0
@@ -1071,7 +1123,8 @@ function Invoke-SampleAnalysis {
     Write-Host (' {0} -> {1} ({2:P0} of source, {3:N2}x speed)' -f (Format-FileSize $s), (Format-FileSize $e), ($e / [Math]::Max(1, $s)), ($clipSeconds / [Math]::Max(0.001, $sw.Elapsed.TotalSeconds)))
 
     if ($IncludeVmaf) {
-      $clipScores = Measure-Vmaf -Distorted $encClip -Reference $srcClip -WorkDir $WorkDir
+      $clipScores = Measure-Vmaf -Distorted $encClip -Reference $srcClip -WorkDir $WorkDir `
+        -Info $Info -MaxHeight $MaxHeight
       if ($clipScores) { foreach ($x in $clipScores) { $scores.Add($x) } }
     }
   }
@@ -1103,8 +1156,8 @@ function Get-Projection {
     .SYNOPSIS
         Extrapolates sample results to the whole file.
     .DESCRIPTION
-        Applies the sample size ratio to the video stream only; audio, subtitles and attachments are
-        assumed to be copied unchanged.
+        Applies the sample size ratio to the video stream only; sample encodes use the selected scaling
+        limit. Audio, subtitles and attachments are assumed to be copied unchanged.
     .PARAMETER Info
         Object returned by Get-MediaInfo.
     .PARAMETER Sample
@@ -1202,7 +1255,8 @@ function Get-Verdict {
 function Get-OutputPath {
   <#
     .SYNOPSIS
-        Builds the re-encoded output path: <name>.<codec>.mkv in OutputDir or beside the source.
+        Builds the re-encoded output path in OutputDir or beside the source. When MaxHeight is set,
+        the height is included in the output filename.
     .PARAMETER SourcePath
         Full path of the source video.
     .PARAMETER Codec
@@ -1217,11 +1271,13 @@ function Get-OutputPath {
   param(
     [Parameter(Mandatory)][string]$SourcePath,
     [Parameter(Mandatory)][string]$Codec,
-    [string]$OutputDir
+    [string]$OutputDir,
+    [int]$MaxHeight = 0
   )
   $dir = if ($OutputDir) { $OutputDir } else { Split-Path -Parent $SourcePath }
   $base = [System.IO.Path]::GetFileNameWithoutExtension($SourcePath)
-  return (Join-Path $dir ('{0}.{1}.mkv' -f $base, $Codec))
+  $suffix = if ($MaxHeight -gt 0) { '{0}-{1}p' -f $Codec, $MaxHeight } else { $Codec }
+  return (Join-Path $dir ('{0}.{1}.mkv' -f $base, $suffix))
 }
 
 function Get-FfmpegReencodeArguments {
@@ -1241,6 +1297,8 @@ function Get-FfmpegReencodeArguments {
         Constant-quality value.
     .PARAMETER Preset
         Encoder preset.
+    .PARAMETER MaxHeight
+        Optional output height cap; scaling is only applied when the source is taller.
     .PARAMETER Gpu
         Selected GPU adapter, or $null to encode on the CPU.
     .PARAMETER AvailableEncoders
@@ -1256,6 +1314,7 @@ function Get-FfmpegReencodeArguments {
     [Parameter(Mandatory)][string]$Codec,
     [Parameter(Mandatory)][int]$Crf,
     [Parameter(Mandatory)][string]$Preset,
+    [int]$MaxHeight = 0,
     [AllowNull()][pscustomobject]$Gpu,
     [string[]]$AvailableEncoders = @()
   )
@@ -1266,7 +1325,8 @@ function Get-FfmpegReencodeArguments {
     '-map_metadata', '0', '-map_chapters', '0',
     '-c', 'copy')
   $a += @(Get-VideoEncoderArguments -Codec $Codec -Crf $Crf -Preset $Preset -Gpu $Gpu `
-      -AvailableEncoders $AvailableEncoders)
+      -AvailableEncoders $AvailableEncoders `
+      -ScaleFilter (Get-ScaleFilter -SourceHeight $Info.Height -MaxHeight $MaxHeight))
   $a += @('-c:s', $subCodec, $OutputPath)
   return $a
 }
@@ -1285,6 +1345,8 @@ function Get-HandBrakeArguments {
         Constant-quality value (HandBrake's -q).
     .PARAMETER Preset
         Encoder preset.
+    .PARAMETER MaxHeight
+        Optional maximum output height in pixels.
     .OUTPUTS
         [string[]]
     #>
@@ -1295,11 +1357,14 @@ function Get-HandBrakeArguments {
     [Parameter(Mandatory)][string]$OutputPath,
     [Parameter(Mandatory)][string]$Codec,
     [Parameter(Mandatory)][int]$Crf,
-    [Parameter(Mandatory)][string]$Preset
+    [Parameter(Mandatory)][string]$Preset,
+    [int]$MaxHeight = 0
   )
   $enc = if ($Codec -eq 'x265') { 'x265_10bit' } else { 'svt_av1_10bit' }
-  return @('-i', $Info.Path, '-o', $OutputPath, '-f', 'av_mkv', '-e', $enc, '-q', "$Crf", '--encoder-preset', $Preset,
+  $a = @('-i', $Info.Path, '-o', $OutputPath, '-f', 'av_mkv', '-e', $enc, '-q', "$Crf", '--encoder-preset', $Preset,
     '--vfr', '--crop', '0:0:0:0', '--all-audio', '-E', 'copy', '--audio-fallback', 'opus', '--all-subtitles', '--markers')
+  if ($MaxHeight -gt 0) { $a += @('--maxHeight', "$MaxHeight") }
+  return $a
 }
 
 function Write-NextSteps {
@@ -1344,7 +1409,8 @@ function Write-NextSteps {
     [Parameter(Mandatory)][string]$OutputPath,
     [Parameter(Mandatory)][double]$MinVmaf,
     [AllowNull()][pscustomobject]$Gpu,
-    [string[]]$AvailableEncoders = @()
+    [string[]]$AvailableEncoders = @(),
+    [int]$MaxHeight = 0
   )
   Write-Host '[4] Next steps' -ForegroundColor Cyan
 
@@ -1362,7 +1428,7 @@ function Write-NextSteps {
   }
 
   $ff = Get-FfmpegReencodeArguments -Info $Info -OutputPath $OutputPath -Codec $Codec -Crf $Crf -Preset $Preset `
-    -Gpu $Gpu -AvailableEncoders $AvailableEncoders
+    -Gpu $Gpu -AvailableEncoders $AvailableEncoders -MaxHeight $MaxHeight
   Write-Host ''
   Write-Host '    ffmpeg:' -ForegroundColor Yellow
   Write-Host ('      ' + (Format-CommandLine -Executable 'ffmpeg' -Arguments $ff))
@@ -1376,7 +1442,8 @@ function Write-NextSteps {
   Write-Host ''
   Write-Host '    HandBrakeCLI (or set the same values in the GUI):' -ForegroundColor Yellow
   if ($Gpu) { Write-Host '      Note: this HandBrakeCLI example uses its CPU encoder; use the ffmpeg command above for GPU encoding.' -ForegroundColor DarkGray }
-  $hb = Get-HandBrakeArguments -Info $Info -OutputPath $OutputPath -Codec $Codec -Crf $Crf -Preset $Preset
+  $hb = Get-HandBrakeArguments -Info $Info -OutputPath $OutputPath -Codec $Codec -Crf $Crf -Preset $Preset `
+    -MaxHeight $MaxHeight
   Write-Host ('      ' + (Format-CommandLine -Executable 'HandBrakeCLI' -Arguments $hb))
   if (-not $Script:HandBrakeExe) { Write-Host '      (HandBrakeCLI not found on this PC; download it from handbrake.fr, or use the GUI with the same settings.)' -ForegroundColor DarkGray }
   Write-Host '      Needs HandBrake 1.6+ for svt_av1_10bit. HandBrake auto-crops by default; --crop 0:0:0:0 disables that.' -ForegroundColor DarkGray
@@ -1418,14 +1485,16 @@ function Invoke-Reencode {
     [Parameter(Mandatory)][string]$Codec,
     [Parameter(Mandatory)][int]$Crf,
     [Parameter(Mandatory)][string]$Preset,
+    [int]$MaxHeight = 0,
     [AllowNull()][pscustomobject]$Gpu,
     [string[]]$AvailableEncoders = @()
   )
   $ffArgs = @(Get-FfmpegReencodeArguments -Info $Info -OutputPath $OutputPath -Codec $Codec -Crf $Crf -Preset $Preset `
-      -Gpu $Gpu -AvailableEncoders $AvailableEncoders)
+      -Gpu $Gpu -AvailableEncoders $AvailableEncoders -MaxHeight $MaxHeight)
   $ffArgs = @('-loglevel', 'warning', '-stats') + $ffArgs
   $backend = if ($Gpu) { "GPU '$($Gpu.Name)'" } else { 'CPU' }
-  Write-Host "[5] Re-encoding to $OutputPath using $backend" -ForegroundColor Cyan
+  $resolutionLabel = if ($MaxHeight -gt 0) { " (max ${MaxHeight}p)" } else { '' }
+  Write-Host "[5] Re-encoding to $OutputPath using $backend$resolutionLabel" -ForegroundColor Cyan
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $oldPreference = $ErrorActionPreference
   $oldCudaDeviceOrder = $env:CUDA_DEVICE_ORDER
@@ -1499,7 +1568,8 @@ if (-not (Test-Path -LiteralPath $tempRoot)) { New-Item -ItemType Directory -Pat
 
 $files = @(Get-VideoFiles -Paths $Path -Recurse:$Recurse)
 if ($files.Count -eq 0) { throw 'No video files found.' }
-Write-Host ('Analyzing {0} file(s): {1} CRF {2} preset {3}{4}' -f $files.Count, $Codec, $Crf, $Preset, $(if ($SkipSample) { ' (triage only)' } else { '' })) -ForegroundColor White
+$resolutionLabel = if ($MaxHeight -gt 0) { ", max ${MaxHeight}p" } else { '' }
+Write-Host ('Analyzing {0} file(s): {1} CRF {2} preset {3}{4}{5}' -f $files.Count, $Codec, $Crf, $Preset, $resolutionLabel, $(if ($SkipSample) { ' (triage only)' } else { '' })) -ForegroundColor White
 Write-Host "CPU: $cpuName" -ForegroundColor DarkGray
 if ($selectedGpu) {
   Write-Host ('Encoding backend: GPU - {0} ({1}); VMAF and non-encoding analysis use the CPU.' -f $selectedGpu.Name, $gpuEncoderName) -ForegroundColor Cyan
@@ -1516,7 +1586,7 @@ foreach ($file in $files) {
   Write-Host ('=== [{0}/{1}] {2}' -f $i, $files.Count, $file.FullName) -ForegroundColor White
   try {
     $info = Get-MediaInfo -LiteralPath $file.FullName
-    $triage = Get-TriageAssessment -Info $info -Codec $Codec
+    $triage = Get-TriageAssessment -Info $info -Codec $Codec -MaxHeight $MaxHeight
     Write-TriageReport -Info $info -Triage $triage
 
     $sample = $null; $projection = $null
@@ -1526,7 +1596,7 @@ foreach ($file in $files) {
       try {
         $sample = Invoke-SampleAnalysis -Info $info -Codec $Codec -Crf $Crf -Preset $Preset -WorkDir $work `
           -SampleCount $SampleCount -SampleSeconds $SampleSeconds -Gpu $selectedGpu `
-          -AvailableEncoders $caps.VideoEncoders -IncludeVmaf (-not $SkipVmaf)
+          -AvailableEncoders $caps.VideoEncoders -IncludeVmaf (-not $SkipVmaf) -MaxHeight $MaxHeight
         $projection = Get-Projection -Info $info -Sample $sample
       }
       finally {
@@ -1549,10 +1619,10 @@ foreach ($file in $files) {
     Write-Host ('{0} ({1})' -f $verdict.Verdict, $verdict.Basis) -ForegroundColor $vColor
     foreach ($r in $verdict.Reasons) { Write-Host "      $r" -ForegroundColor DarkGray }
 
-    $outPath = Get-OutputPath -SourcePath $info.Path -Codec $Codec -OutputDir $OutputDir
+    $outPath = Get-OutputPath -SourcePath $info.Path -Codec $Codec -OutputDir $OutputDir -MaxHeight $MaxHeight
     Write-NextSteps -Info $info -Triage $triage -Sample $sample -Projection $projection -Verdict $verdict `
       -Codec $Codec -Crf $Crf -Preset $Preset -OutputPath $outPath -MinVmaf $MinVmaf `
-      -Gpu $selectedGpu -AvailableEncoders $caps.VideoEncoders
+      -Gpu $selectedGpu -AvailableEncoders $caps.VideoEncoders -MaxHeight $MaxHeight
 
     $enc = $null
     if ($Reencode) {
@@ -1562,9 +1632,9 @@ foreach ($file in $files) {
       elseif (Test-Path -LiteralPath $outPath) {
         Write-Warning "Output already exists, skipping: $outPath"
       }
-      elseif ($PSCmdlet.ShouldProcess($info.Path, "Re-encode to '$outPath' ($Codec, CRF $Crf, preset $Preset)")) {
+      elseif ($PSCmdlet.ShouldProcess($info.Path, "Re-encode to '$outPath' ($Codec, CRF $Crf, preset $Preset$resolutionLabel)")) {
         $enc = Invoke-Reencode -Info $info -OutputPath $outPath -Codec $Codec -Crf $Crf -Preset $Preset `
-          -Gpu $selectedGpu -AvailableEncoders $caps.VideoEncoders
+          -Gpu $selectedGpu -AvailableEncoders $caps.VideoEncoders -MaxHeight $MaxHeight
       }
     }
 
@@ -1573,6 +1643,7 @@ foreach ($file in $files) {
         SizeBytes           = $info.FileSize
         Codec               = $info.Codec
         Resolution          = ('{0}x{1}' -f $info.Width, $info.Height)
+        MaxOutputHeight     = $(if ($MaxHeight -gt 0) { $MaxHeight } else { $null })
         DurationSeconds     = [Math]::Round($info.Duration, 1)
         VideoKbps           = [Math]::Round($info.VideoBitrate / 1000)
         BitsPerPixel        = [Math]::Round($triage.Bpp, 3)
